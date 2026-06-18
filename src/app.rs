@@ -114,6 +114,28 @@ impl App {
         };
     }
 
+    /// Jump the active panel's cursor to what it is currently playing/loading:
+    /// the playing MIDI file in the MIDI panel, the loaded SoundFont in the
+    /// SoundFont panel. Navigates into the right directory or archive first.
+    pub fn goto_current(&mut self) {
+        let loc = match self.active {
+            Panel::Midi => self.now_playing.clone(),
+            Panel::Sf2 => self.soundfont.clone(),
+        };
+        let Some(loc) = loc else {
+            self.message = Some(
+                match self.active {
+                    Panel::Midi => "Nothing playing",
+                    Panel::Sf2 => "No SoundFont loaded",
+                }
+                .into(),
+            );
+            return;
+        };
+        self.active_browser().reveal(&loc);
+        self.message = None;
+    }
+
     /// Enter directory or act on the selected file depending on the panel.
     pub fn activate_selection(&mut self) {
         let is_dir = self

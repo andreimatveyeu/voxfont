@@ -172,6 +172,18 @@ impl Browser {
         }
     }
 
+    /// Navigate to `loc`'s containing directory/archive (if not already there)
+    /// and move the cursor onto it. Spans filesystem directories and zip
+    /// archives, since the container is resolved through [`Location::parent`].
+    pub fn reveal(&mut self, loc: &Location) {
+        if let Some(parent) = loc.parent() {
+            if self.dir != parent {
+                self.set_loc(parent);
+            }
+            self.select_loc(loc);
+        }
+    }
+
     /// The nearest real filesystem directory, for session persistence and the
     /// "go to directory" prompt (which only operate on the filesystem).
     pub fn fs_dir(&self) -> PathBuf {
@@ -429,6 +441,46 @@ mod tests {
         b.enter_dir();
         assert_eq!(b.dir, Location::Fs(d.path().to_path_buf()));
         assert_eq!(b.selected().unwrap().name, "sub");
+    }
+
+    #[test]
+    fn reveal_navigates_to_a_files_directory() {
+        let d = tempdir().unwrap();
+        fs::create_dir(d.path().join("sub")).unwrap();
+        fs::write(d.path().join("sub").join("song.mid"), b"x").unwrap();
+        fs::write(d.path().join("other.mid"), b"x").unwrap();
+
+        // Start in the root, sitting on a different entry.
+        let mut b = Browser::new_at(Location::Fs(d.path().to_path_buf()), &["mid"], false, false);
+        let target = Location::Fs(d.path().join("sub").join("song.mid"));
+        b.reveal(&target);
+
+        // It should have descended into "sub" and put the cursor on the file.
+        assert_eq!(b.dir, Location::Fs(d.path().join("sub")));
+        assert_eq!(b.selected().unwrap().loc, target);
+    }
+
+    #[test]
+    fn reveal_descends_into_zip_member() {
+        let d = tempdir().unwrap();
+        let zip = d.path().join("songs.zip");
+        make_zip(&zip, &["a/x.mid", "b.mid"]);
+
+        let mut b = Browser::new_at(Location::Fs(d.path().to_path_buf()), &["mid"], false, true);
+        let target = Location::Zip {
+            archive: zip.clone(),
+            inner: "a/x.mid".to_string(),
+        };
+        b.reveal(&target);
+
+        assert_eq!(
+            b.dir,
+            Location::Zip {
+                archive: zip,
+                inner: "a".to_string()
+            }
+        );
+        assert_eq!(b.selected().unwrap().loc, target);
     }
 
     /// Build a zip with the given members (dirs end in '/') at `path`.

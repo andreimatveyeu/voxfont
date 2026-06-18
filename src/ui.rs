@@ -282,7 +282,7 @@ fn draw_hints(app: &App, frame: &mut Frame, area: Rect) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    let hint = "Tab panels  Enter play/load  Space pause  s stop  ←/→ seek  n next-mode  r repeat  </> vol  i go  / search  h help  q quit";
+    let hint = "Tab panels  Enter play/load  Space pause  s stop  ←/→ seek  n next-mode  r repeat  </> vol  i go  G playing  / search  h help  q quit";
     frame.render_widget(
         Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
         area,
@@ -303,6 +303,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  Enter          enter dir · play MIDI · load SoundFont"),
         Line::from("  U              go up a directory"),
         Line::from("  i              go to directory (Tab completes)"),
+        Line::from("  G              jump to playing track / loaded SoundFont"),
         Line::from("  Space / p      pause / resume"),
         Line::from("  s              stop"),
         Line::from("  ← →            seek 5s    [ ]  seek 30s"),

@@ -217,6 +217,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => app.activate_selection(),
         KeyCode::Char('U') => app.active_browser().go_up(),
         KeyCode::Char('i') => app.start_goto(),
+        // Jump to the currently playing MIDI / loaded SoundFont.
+        KeyCode::Char('G') => app.goto_current(),
 
         KeyCode::Char('p') | KeyCode::Char(' ') => app.toggle_pause(),
         KeyCode::Char('s') => app.stop(),

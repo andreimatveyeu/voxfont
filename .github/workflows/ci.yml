@@ -1,10 +1,12 @@
 name: CI
 
-# Build, lint and test on every branch push and pull request.
+# Build, lint and test on master pushes and on pull requests. Feature branches
+# are covered by the pull_request trigger, so pushing them does not also run CI
+# (which would otherwise double up with the PR run).
 # Tag pushes are handled by release.yml (tags don't match `branches`).
 on:
   push:
-    branches: ["**"]
+    branches: ["master"]
   pull_request:
 
 permissions:

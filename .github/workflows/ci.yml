@@ -1,0 +1,46 @@
+name: CI
+
+# Build, lint and test on every branch push and pull request.
+# Tag pushes are handled by release.yml (tags don't match `branches`).
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # voxfont's build script links libfluidsynth.so directly (no bindgen), so
+      # the shared library must be present to compile. The -dev package provides
+      # the linker symlink and pulls in the runtime library.
+      - name: Install FluidSynth
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfluidsynth-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --locked

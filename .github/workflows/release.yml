@@ -1,0 +1,47 @@
+name: Release
+
+# Triggered by pushing a semver tag, e.g. `git tag 1.2.0 && git push origin 1.2.0`.
+# The tag name (no `v` prefix) becomes the package version.
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FluidSynth
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfluidsynth-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Stamp version from tag
+        run: |
+          version="${GITHUB_REF_NAME}"
+          # Replace only the package version (the first `version = "..."` line).
+          sed -i -E "0,/^version *= *\".*\"/ s//version = \"${version}\"/" Cargo.toml
+          echo "Building voxfont ${version}"
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Stage artifact
+        run: |
+          install -Dm755 target/release/voxfont \
+            "voxfont-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: voxfont-${{ github.ref_name }}-x86_64-unknown-linux-gnu
+          generate_release_notes: true

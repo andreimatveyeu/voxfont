@@ -15,6 +15,7 @@ pub fn draw(f: &mut App, frame: &mut Frame) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),    // panels
+            Constraint::Length(1), // item counts
             Constraint::Length(4), // player bar
             Constraint::Length(1), // key hints
         ])
@@ -27,8 +28,9 @@ pub fn draw(f: &mut App, frame: &mut Frame) {
 
     draw_panel(f, frame, panels[0], Panel::Midi, "MIDI files");
     draw_panel(f, frame, panels[1], Panel::Sf2, "SoundFonts");
-    draw_player(f, frame, rows[1]);
-    draw_hints(f, frame, rows[2]);
+    draw_counts(f, frame, rows[1]);
+    draw_player(f, frame, rows[2]);
+    draw_hints(f, frame, rows[3]);
 
     if f.show_help {
         draw_help(frame, area);
@@ -128,6 +130,34 @@ fn draw_panel(app: &mut App, frame: &mut Frame, area: Rect, panel: Panel, title:
         Panel::Sf2 => &mut app.sf2.state,
     };
     frame.render_stateful_widget(list, area, state);
+}
+
+/// One line directly above the player bar showing how many items each panel's
+/// current directory/archive holds (the ".." parent is not counted). Aligned in
+/// two halves under the panels; the active panel's count is highlighted.
+fn draw_counts(app: &App, frame: &mut Frame, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    for (panel, col) in [(Panel::Midi, cols[0]), (Panel::Sf2, cols[1])] {
+        let browser = match panel {
+            Panel::Midi => &app.midi,
+            Panel::Sf2 => &app.sf2,
+        };
+        let n = browser.item_count();
+        // Leading space lines the text up with the bordered panel above it.
+        let label = format!(" {n} item{}", if n == 1 { "" } else { "s" });
+        let style = if app.active == panel {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        frame.render_widget(Paragraph::new(Span::styled(label, style)), col);
+    }
 }
 
 fn draw_player(app: &App, frame: &mut Frame, area: Rect) {

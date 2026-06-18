@@ -77,7 +77,8 @@ impl Browser {
                     loc: c.loc,
                     is_dir: true,
                     is_parent: false,
-                    size: 0,
+                    // 0 for plain directories; an archive carries its file size.
+                    size: c.size,
                     duration: None,
                 });
             } else if self.matches_ext(&c.name) {

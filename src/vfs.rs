@@ -277,7 +277,9 @@ fn read_dir_fs(dir: &Path, allow_archives: bool) -> Vec<DirChild> {
                     size: 0,
                 });
             } else if allow_archives && is_archive(&name) {
-                // Present the archive as a directory the user can step into.
+                // Present the archive as a directory the user can step into, but
+                // keep its real file size so the list can show it like any file.
+                let size = ent.metadata().map(|m| m.len()).unwrap_or(0);
                 out.push(DirChild {
                     name,
                     loc: Location::Zip {
@@ -285,7 +287,7 @@ fn read_dir_fs(dir: &Path, allow_archives: bool) -> Vec<DirChild> {
                         inner: String::new(),
                     },
                     is_dir: true,
-                    size: 0,
+                    size,
                 });
             } else {
                 let size = ent.metadata().map(|m| m.len()).unwrap_or(0);
@@ -501,10 +503,13 @@ mod tests {
         assert_eq!(
             z.loc,
             Location::Zip {
-                archive: zip,
+                archive: zip.clone(),
                 inner: String::new()
             }
         );
+        // The archive reports its real file size, so the list can show it.
+        assert_eq!(z.size, std::fs::metadata(&zip).unwrap().len());
+        assert!(z.size > 0);
 
         // With archives disabled (the SoundFont panel), the .zip is reported as
         // an ordinary file instead, so extension filtering can drop it.

@@ -102,9 +102,15 @@ fn draw_panel(app: &mut App, frame: &mut Frame, area: Rect, panel: Panel, title:
             };
             let marker = if playing { "♪ " } else { "  " };
 
-            // Right-hand column: SoundFont size or MIDI duration.
+            // Right-hand column: archive/SoundFont size or MIDI duration.
+            // Archives are shown as directories but carry a file size, rendered
+            // the same way as SoundFont sizes; plain directories stay blank.
             let right = if e.is_dir {
-                String::new()
+                if e.size > 0 {
+                    human_size(e.size)
+                } else {
+                    String::new()
+                }
             } else {
                 match panel {
                     Panel::Sf2 => human_size(e.size),

@@ -53,9 +53,14 @@ fn draw_panel(app: &mut App, frame: &mut Frame, area: Rect, panel: Panel, title:
     let dir = browser.dir_display();
     let n = browser.item_count();
     // Item count sits on the bottom border (right-aligned) instead of taking a
-    // whole row of its own.
+    // whole row of its own. While filtering it shows matches out of the total.
+    let count_text = if browser.is_filtered() {
+        format!(" {n} of {} ", browser.total_count())
+    } else {
+        format!(" {n} item{} ", if n == 1 { "" } else { "s" })
+    };
     let count = Line::from(Span::styled(
-        format!(" {n} item{} ", if n == 1 { "" } else { "s" }),
+        count_text,
         Style::default().fg(if active { Color::Cyan } else { Color::DarkGray }),
     ))
     .right_aligned();
@@ -282,7 +287,7 @@ fn draw_hints(app: &App, frame: &mut Frame, area: Rect) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    let hint = "Tab panels  Enter play/load  Space pause  s stop  ←/→ seek  n next-mode  r repeat  </> vol  i go  G playing  / search  h help  q quit";
+    let hint = "Tab panels  Enter play/load  Space pause  s stop  ←/→ seek  n next-mode  r repeat  </> vol  i go  G playing  / filter  h help  q quit";
     frame.render_widget(
         Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
         area,
@@ -312,7 +317,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  < >            volume -1 / +1     , .  volume -5 / +5"),
         Line::from("  M-1..M-9       volume 10%..90%"),
         Line::from("  H              toggle hidden files   ^r  reload panel"),
-        Line::from("  / or g         search in panel"),
+        Line::from("  / or g         filter list  (↑↓ move · Enter act · Esc clear)"),
         Line::from("  h / ?          this help          q / Q  quit"),
         Line::from(""),
         Line::from(Span::styled(

@@ -268,21 +268,18 @@ fn handle_goto_key(app: &mut App, key: KeyEvent) {
 
 fn handle_search_key(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc | KeyCode::Enter => app.search = None,
-        KeyCode::Backspace => {
-            if let Some(q) = app.search.as_mut() {
-                q.pop();
-            }
-            let q = app.search.clone().unwrap_or_default();
-            app.active_browser().search(&q);
-        }
-        KeyCode::Char(c) => {
-            if let Some(q) = app.search.as_mut() {
-                q.push(c);
-            }
-            let q = app.search.clone().unwrap_or_default();
-            app.active_browser().search(&q);
-        }
+        KeyCode::Esc => app.search_cancel(),
+        // Act on the highlighted match and leave the filter.
+        KeyCode::Enter => app.search_accept(),
+        // Move within the filtered matches without leaving search.
+        KeyCode::Up => app.active_browser().move_up(1),
+        KeyCode::Down => app.active_browser().move_down(1),
+        KeyCode::PageUp => app.active_browser().move_up(10),
+        KeyCode::PageDown => app.active_browser().move_down(10),
+        KeyCode::Home => app.active_browser().home(),
+        KeyCode::End => app.active_browser().end(),
+        KeyCode::Backspace => app.search_backspace(),
+        KeyCode::Char(c) => app.search_push(c),
         _ => {}
     }
 }

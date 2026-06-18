@@ -149,6 +149,12 @@ impl Browser {
         self.dir.display()
     }
 
+    /// Number of real entries in the current directory/archive, excluding the
+    /// synthetic ".." parent.
+    pub fn item_count(&self) -> usize {
+        self.entries.iter().filter(|e| !e.is_parent).count()
+    }
+
     /// The current directory location (for session persistence).
     pub fn location(&self) -> Location {
         self.dir.clone()

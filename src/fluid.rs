@@ -170,6 +170,12 @@ impl Synth {
         let c = cstr(midi)?;
         unsafe {
             self.drop_player();
+            // Silence any notes the previous track left held. Stopping/deleting
+            // the player does not send note-offs, so without this a new track
+            // starts on top of hanging notes. This resets MIDI state on the
+            // existing synth only — the audio driver (and its PipeWire/JACK
+            // connections) is untouched.
+            fluid_synth_system_reset(self.synth);
             let p = new_fluid_player(self.synth);
             if p.is_null() {
                 return Err("new_fluid_player failed".into());

@@ -4,6 +4,7 @@ mod fluid;
 mod midi;
 mod state;
 mod ui;
+mod vfs;
 
 use app::App;
 use ratatui::crossterm::{
@@ -26,14 +27,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Restore the previous session, then apply precedence:
-    // CLI arg > saved directory > $HOME.
+    // CLI arg > saved location > $HOME.
     let saved = state::load();
-    let dir_arg = |a: Option<&String>| a.map(PathBuf::from).filter(|p| p.is_dir());
-    let saved_dir = |p: &Option<PathBuf>| p.clone().filter(|p| p.is_dir());
+    let dir_arg = |a: Option<&String>| {
+        a.map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .map(vfs::Location::Fs)
+    };
+    let saved_dir = |l: &Option<vfs::Location>| l.clone().filter(|l| l.is_openable_dir());
     let home = || {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
+        vfs::Location::Fs(
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(".")),
+        )
     };
     let midi_dir = dir_arg(args.first())
         .or_else(|| saved_dir(&saved.midi_dir))
@@ -50,8 +57,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Reload the last SoundFont if it still exists.
-    if let Some(sf) = saved.soundfont.filter(|p| p.is_file()) {
+    // Seed the remembered file (before any load, which would re-save state) and
+    // put the MIDI cursor on it if it is in the opened directory.
+    app.last_played = saved.midi_file.clone();
+    if let Some(f) = saved.midi_file.filter(|l| l.exists()) {
+        app.midi.select_loc(&f);
+    }
+
+    // Reload the last SoundFont if it still exists, landing the cursor on it.
+    if let Some(sf) = saved.soundfont.filter(|l| l.exists()) {
+        app.sf2.select_loc(&sf);
         app.load_soundfont(sf);
     }
 

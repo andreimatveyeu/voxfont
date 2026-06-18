@@ -4,9 +4,11 @@
 use crate::browser::Browser;
 use crate::fluid::Synth;
 use crate::midi::{self, MidiInfo};
+use crate::vfs::{self, Location};
 use rustyline::completion::{longest_common_prefix, Candidate, FilenameCompleter};
 use std::path::PathBuf;
 use std::time::Instant;
+use tempfile::NamedTempFile;
 
 pub const MIDI_EXTS: &[&str] = &["mid", "midi", "kar", "rmi"];
 pub const SF2_EXTS: &[&str] = &["sf2", "sf3"];
@@ -31,10 +33,19 @@ pub struct App {
     pub synth: Synth,
 
     pub state: PlayState,
-    pub now_playing: Option<PathBuf>,
-    pub soundfont: Option<PathBuf>,
+    pub now_playing: Option<Location>,
+    pub soundfont: Option<Location>,
+    /// The most recently played file, remembered across sessions so the cursor
+    /// can return to it on launch. Unlike `now_playing` it is seeded from the
+    /// saved session at startup (before anything is actually played).
+    pub last_played: Option<Location>,
     /// Parsed metadata (division, time signature, duration) of the current track.
     pub cur_info: Option<MidiInfo>,
+
+    /// Temp files backing the current track / SoundFont when they come from an
+    /// archive. Kept alive while in use; dropping them deletes the temp file.
+    play_temp: Option<NamedTempFile>,
+    sf_temp: Option<NamedTempFile>,
 
     pub volume: u8, // 0..=100
     /// Repeat mode: loop the current track (next off) or the directory (next on).
@@ -57,20 +68,25 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(midi_dir: PathBuf, sf2_dir: PathBuf) -> Result<App, String> {
+    pub fn new(midi_dir: Location, sf2_dir: Location) -> Result<App, String> {
         let (mut synth, warn) = Synth::new()?;
         let volume = 60u8;
         synth.set_gain(volume_to_gain(volume));
 
         Ok(App {
-            midi: Browser::new(midi_dir, MIDI_EXTS, true),
-            sf2: Browser::new(sf2_dir, SF2_EXTS, false),
+            // Only the MIDI panel browses into archives; SoundFonts come from
+            // the filesystem only.
+            midi: Browser::new_at(midi_dir, MIDI_EXTS, true, true),
+            sf2: Browser::new_at(sf2_dir, SF2_EXTS, false, false),
             active: Panel::Midi,
             synth,
             state: PlayState::Stopped,
             now_playing: None,
             soundfont: None,
+            last_played: None,
             cur_info: None,
+            play_temp: None,
+            sf_temp: None,
             volume,
             repeat: false,
             next_mode: true,
@@ -109,21 +125,31 @@ impl App {
             self.active_browser().enter_dir();
             return;
         }
-        let path = match self.active_browser().selected() {
-            Some(e) => e.path.clone(),
+        let loc = match self.active_browser().selected() {
+            Some(e) => e.loc.clone(),
             None => return,
         };
         match self.active {
-            Panel::Sf2 => self.load_soundfont(path),
-            Panel::Midi => self.play_path(path),
+            Panel::Sf2 => self.load_soundfont(loc),
+            Panel::Midi => self.play_path(loc),
         }
     }
 
-    pub fn load_soundfont(&mut self, path: PathBuf) {
+    pub fn load_soundfont(&mut self, loc: Location) {
+        // Archive members are extracted to a temp file first, since the FFI
+        // loads SoundFonts by filename only.
+        let (path, guard) = match vfs::resolve_to_file(&loc) {
+            Ok(r) => r,
+            Err(e) => {
+                self.message = Some(e);
+                return;
+            }
+        };
         match self.synth.load_soundfont(&path) {
             Ok(()) => {
-                let name = file_name(&path);
-                self.soundfont = Some(path);
+                let name = loc.file_name();
+                self.soundfont = Some(loc);
+                self.sf_temp = guard;
                 self.message = Some(format!("SoundFont loaded: {name}"));
                 self.save_state();
             }
@@ -131,26 +157,41 @@ impl App {
         }
     }
 
-    /// Persist the current directories and loaded SoundFont for next launch.
+    /// Persist the current directories, the last-played MIDI file and the loaded
+    /// SoundFont for next launch. Directories and the played file keep their full
+    /// location, so an archive (or a file inside one) is restored as such.
     pub fn save_state(&self) {
         crate::state::save(&crate::state::State {
-            midi_dir: Some(self.midi.dir.clone()),
-            sf2_dir: Some(self.sf2.dir.clone()),
+            midi_dir: Some(self.midi.location()),
+            midi_file: self.last_played.clone(),
+            sf2_dir: Some(self.sf2.location()),
             soundfont: self.soundfont.clone(),
         });
     }
 
-    pub fn play_path(&mut self, path: PathBuf) {
+    pub fn play_path(&mut self, loc: Location) {
         if !self.synth.has_soundfont() {
             self.message =
                 Some("No SoundFont loaded — pick one in the right panel (Tab, then Enter)".into());
             return;
         }
+        // Archive members are extracted to a temp file first, since the FFI
+        // plays MIDI by filename only. The guard is kept alive past `play`
+        // because fluidsynth loads the file lazily on its audio thread.
+        let (path, guard) = match vfs::resolve_to_file(&loc) {
+            Ok(r) => r,
+            Err(e) => {
+                self.message = Some(e);
+                return;
+            }
+        };
         match self.synth.play(&path) {
             Ok(()) => {
                 self.message = None;
                 self.cur_info = midi::parse(&path);
-                self.now_playing = Some(path);
+                self.now_playing = Some(loc.clone());
+                self.last_played = Some(loc);
+                self.play_temp = guard;
                 self.state = PlayState::Playing;
                 self.play_started = Some(Instant::now());
                 self.accumulated_secs = 0.0;
@@ -343,9 +384,11 @@ impl App {
 
     // --- "go to directory" prompt (the `i` key) --------------------------------
 
-    /// Open the GO prompt, pre-filled with the active panel's directory.
+    /// Open the GO prompt, pre-filled with the active panel's directory. The
+    /// prompt navigates the filesystem only, so an archive resolves to the
+    /// directory that holds it.
     pub fn start_goto(&mut self) {
-        let mut d = self.active_browser().dir.to_string_lossy().to_string();
+        let mut d = self.active_browser().fs_dir().to_string_lossy().to_string();
         if !d.ends_with('/') {
             d.push('/');
         }
@@ -455,12 +498,6 @@ fn expand_tilde(s: &str) -> String {
     }
 }
 
-pub fn file_name(p: &std::path::Path) -> String {
-    p.file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| p.to_string_lossy().to_string())
-}
-
 /// Drop the last path component of `s`, keeping the trailing slash (for the GO
 /// prompt's Alt+Backspace). "/a/b/c" -> "/a/b/", "/a/b/" -> "/a/".
 fn delete_path_component(s: &str) -> String {
@@ -556,8 +593,4 @@ mod tests {
         assert_eq!(bar_beat_at(100, &smpte), None);
     }
 
-    #[test]
-    fn file_name_basename() {
-        assert_eq!(file_name(std::path::Path::new("/a/b/song.mid")), "song.mid");
-    }
 }

@@ -1,14 +1,21 @@
-//! Persistence of the last session: MIDI directory, SoundFont directory and the
-//! loaded SoundFont. Stored as a tiny `key = value` file under the XDG config
-//! directory (`$XDG_CONFIG_HOME/voxfont/state.conf`, default `~/.config/...`).
+//! Persistence of the last session: the MIDI and SoundFont directories, the
+//! last-played MIDI file, and the loaded SoundFont. Stored as a tiny
+//! `key = value` file under the XDG config directory
+//! (`$XDG_CONFIG_HOME/voxfont/state.conf`, default `~/.config/...`).
+//!
+//! Values are [`Location`]s, so a directory or file inside a zip archive is
+//! persisted too; see [`Location::encode`].
 
+use crate::vfs::Location;
 use std::path::PathBuf;
 
 #[derive(Default)]
 pub struct State {
-    pub midi_dir: Option<PathBuf>,
-    pub sf2_dir: Option<PathBuf>,
-    pub soundfont: Option<PathBuf>,
+    pub midi_dir: Option<Location>,
+    /// The file that was last played, so the cursor can return to it on launch.
+    pub midi_file: Option<Location>,
+    pub sf2_dir: Option<Location>,
+    pub soundfont: Option<Location>,
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -70,9 +77,10 @@ fn parse_conf(text: &str) -> State {
             continue;
         }
         if let Some((key, val)) = line.split_once('=') {
-            let val = PathBuf::from(val.trim());
+            let val = Location::decode(val.trim());
             match key.trim() {
                 "midi_dir" => state.midi_dir = Some(val),
+                "midi_file" => state.midi_file = Some(val),
                 "sf2_dir" => state.sf2_dir = Some(val),
                 "soundfont" => state.soundfont = Some(val),
                 _ => {}
@@ -85,15 +93,16 @@ fn parse_conf(text: &str) -> State {
 /// Render a `State` to the `key = value` config body (only set fields).
 fn serialize(state: &State) -> String {
     let mut out = String::new();
-    let mut line = |key: &str, value: &Option<PathBuf>| {
+    let mut line = |key: &str, value: &Option<Location>| {
         if let Some(v) = value {
             out.push_str(key);
             out.push_str(" = ");
-            out.push_str(&v.to_string_lossy());
+            out.push_str(&v.encode());
             out.push('\n');
         }
     };
     line("midi_dir", &state.midi_dir);
+    line("midi_file", &state.midi_file);
     line("sf2_dir", &state.sf2_dir);
     line("soundfont", &state.soundfont);
     out
@@ -103,15 +112,31 @@ fn serialize(state: &State) -> String {
 mod tests {
     use super::*;
 
+    fn fs(p: &str) -> Option<Location> {
+        Some(Location::Fs(PathBuf::from(p)))
+    }
+
     #[test]
     fn round_trips_through_serialize_and_parse() {
         let state = State {
-            midi_dir: Some(PathBuf::from("/home/me/midi")),
-            sf2_dir: Some(PathBuf::from("/srv/sf2")),
-            soundfont: Some(PathBuf::from("/srv/sf2/CT8MGM.SF2")),
+            // A panel sitting at a zip root encodes with a trailing tab (empty
+            // inner); parse_conf trims each line, so this exercises that the
+            // empty inner still round-trips rather than being mangled.
+            midi_dir: Some(Location::Zip {
+                archive: PathBuf::from("/home/me/midi/songs.zip"),
+                inner: String::new(),
+            }),
+            // A last-played file inside a zip must survive the round trip.
+            midi_file: Some(Location::Zip {
+                archive: PathBuf::from("/home/me/midi/songs.zip"),
+                inner: "classics/canyon.mid".to_string(),
+            }),
+            sf2_dir: fs("/srv/sf2"),
+            soundfont: fs("/srv/sf2/CT8MGM.SF2"),
         };
         let parsed = parse_conf(&serialize(&state));
         assert_eq!(parsed.midi_dir, state.midi_dir);
+        assert_eq!(parsed.midi_file, state.midi_file);
         assert_eq!(parsed.sf2_dir, state.sf2_dir);
         assert_eq!(parsed.soundfont, state.soundfont);
     }
@@ -119,11 +144,12 @@ mod tests {
     #[test]
     fn serialize_omits_unset_fields() {
         let state = State {
-            midi_dir: Some(PathBuf::from("/m")),
+            midi_dir: fs("/m"),
             ..State::default()
         };
         let out = serialize(&state);
         assert!(out.contains("midi_dir = /m"));
+        assert!(!out.contains("midi_file"));
         assert!(!out.contains("sf2_dir"));
         assert!(!out.contains("soundfont"));
     }
@@ -132,8 +158,8 @@ mod tests {
     fn parse_tolerates_blanks_comments_and_unknown_keys() {
         let text = "\n# a comment\n  midi_dir =  /a/b \nbogus = x\nsoundfont=/f.sf2\n";
         let s = parse_conf(text);
-        assert_eq!(s.midi_dir, Some(PathBuf::from("/a/b")));
-        assert_eq!(s.soundfont, Some(PathBuf::from("/f.sf2")));
+        assert_eq!(s.midi_dir, fs("/a/b"));
+        assert_eq!(s.soundfont, fs("/f.sf2"));
         assert_eq!(s.sf2_dir, None);
     }
 

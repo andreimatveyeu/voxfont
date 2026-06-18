@@ -1,6 +1,6 @@
 [package]
 name = "voxfont"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Console MIDI/SoundFont player with a two-panel interface"
 authors = ["Andrei Matveyeu"]
@@ -13,9 +13,13 @@ path = "src/main.rs"
 [dependencies]
 ratatui = "0.30"
 rustyline = "18.0.0"
+# Archive browsing. default-features = false keeps this pure-Rust: only the
+# "deflate" (plus stored) codec is pulled in, which covers the overwhelming
+# majority of real-world zips and avoids dragging in C libraries (bzip2/zstd).
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Used to extract an archive member to a real file so the libfluidsynth FFI,
+# which only loads by filename, can play/load it unchanged.
+tempfile = "3"
 
 [profile.release]
 opt-level = 2
-
-[dev-dependencies]
-tempfile = "3.27.0"

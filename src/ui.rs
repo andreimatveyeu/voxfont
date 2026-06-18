@@ -1,6 +1,6 @@
 //! ratatui rendering: two browser panels above a player bar.
 
-use crate::app::{file_name, App, Panel, PlayState};
+use crate::app::{App, Panel, PlayState};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -50,7 +50,7 @@ fn draw_panel(app: &mut App, frame: &mut Frame, area: Rect, panel: Panel, title:
         Style::default().fg(Color::DarkGray)
     };
 
-    let dir = browser.dir.to_string_lossy();
+    let dir = browser.dir_display();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
@@ -69,12 +69,12 @@ fn draw_panel(app: &mut App, frame: &mut Frame, area: Rect, panel: Panel, title:
             let playing = app
                 .now_playing
                 .as_ref()
-                .map(|p| p == &e.path)
+                .map(|p| p == &e.loc)
                 .unwrap_or(false)
                 || app
                     .soundfont
                     .as_ref()
-                    .map(|p| p == &e.path)
+                    .map(|p| p == &e.loc)
                     .unwrap_or(false);
 
             let (icon, base) = if e.is_parent {
@@ -156,12 +156,12 @@ fn draw_player(app: &App, frame: &mut Frame, area: Rect) {
     let track = app
         .now_playing
         .as_ref()
-        .map(|p| file_name(p))
+        .map(|p| p.file_name())
         .unwrap_or_else(|| "—".to_string());
     let sf = app
         .soundfont
         .as_ref()
-        .map(|p| file_name(p))
+        .map(|p| p.file_name())
         .unwrap_or_else(|| "none".to_string());
 
     let (elapsed, total) = app.times();

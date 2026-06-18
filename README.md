@@ -5,6 +5,10 @@ browses MIDI files (with their durations), the right panel browses SoundFonts
 (`.sf2` / `.sf3`, with their sizes). Pick a SoundFont, then play MIDI files
 through it. Playback is handled by [FluidSynth](https://www.fluidsynth.org/).
 
+In the MIDI panel a `.zip` archive is browsed just like a directory: step into
+it with <kbd>Enter</kbd>, navigate its subfolders, and play files straight from
+it (the selected file is extracted to a temporary file behind the scenes).
+
 The two-panel, keyboard-driven interface is inspired by the
 [mocp](https://moc.daper.net/) console music player.
 

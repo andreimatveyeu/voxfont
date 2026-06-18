@@ -23,6 +23,17 @@ The two-panel, keyboard-driven interface is inspired by the
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
+## Why voxfont
+
+Hear how a MIDI file sounds through different SoundFonts in seconds — no DAW, no
+plugins, no mouse.
+
+- **Fast browsing** — arrows, paging, and `/` search; `i` jumps to any folder.
+- **Instant A/B** — swap the SoundFont under the playing track with one keypress.
+- **At a glance** — durations, sizes, live bar·beat, tempo, and a progress bar.
+- **Lightweight** — launches instantly and drives FluidSynth directly.
+- **Remembers** — restores your directories and SoundFont next time.
+
 ## Build
 
 Requires a Rust toolchain and the FluidSynth shared library

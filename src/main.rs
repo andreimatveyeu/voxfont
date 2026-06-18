@@ -30,7 +30,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let saved = state::load();
     let dir_arg = |a: Option<&String>| a.map(PathBuf::from).filter(|p| p.is_dir());
     let saved_dir = |p: &Option<PathBuf>| p.clone().filter(|p| p.is_dir());
-    let home = || std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = || {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
     let midi_dir = dir_arg(args.first())
         .or_else(|| saved_dir(&saved.midi_dir))
         .unwrap_or_else(home);
@@ -81,7 +85,10 @@ fn selftest(sf2: Option<&String>, midi: Option<&String>) -> Result<(), Box<dyn s
 
     let p = |s: &str, syn: &fluid::Synth| {
         let (c, t) = syn.position().unwrap_or((-1, -1));
-        println!("{s:<22} tick={c:>6}/{t:<6} playing={}", syn.is_playing_status());
+        println!(
+            "{s:<22} tick={c:>6}/{t:<6} playing={}",
+            syn.is_playing_status()
+        );
     };
 
     synth.set_gain(0.5);

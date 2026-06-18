@@ -151,7 +151,11 @@ impl Browser {
             let parent = parent.to_path_buf();
             self.set_dir(parent);
             // Land the cursor on the directory we just came from.
-            if let Some(idx) = self.entries.iter().position(|e| !e.is_parent && e.path == from) {
+            if let Some(idx) = self
+                .entries
+                .iter()
+                .position(|e| !e.is_parent && e.path == from)
+            {
                 self.state.select(Some(idx));
             }
         }
@@ -195,7 +199,11 @@ impl Browser {
             return;
         }
         let q = query.to_lowercase();
-        if let Some(i) = self.entries.iter().position(|e| e.name.to_lowercase().contains(&q)) {
+        if let Some(i) = self
+            .entries
+            .iter()
+            .position(|e| e.name.to_lowercase().contains(&q))
+        {
             self.state.select(Some(i));
         }
     }

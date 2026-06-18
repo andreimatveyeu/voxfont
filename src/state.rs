@@ -32,8 +32,12 @@ fn legacy_config_path() -> Option<PathBuf> {
             return Some(PathBuf::from(x).join("sfplay").join("state.conf"));
         }
     }
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".config").join("sfplay").join("state.conf"))
+    std::env::var_os("HOME").map(|h| {
+        PathBuf::from(h)
+            .join(".config")
+            .join("sfplay")
+            .join("state.conf")
+    })
 }
 
 pub fn load() -> State {

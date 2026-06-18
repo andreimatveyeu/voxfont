@@ -43,7 +43,9 @@ fn draw_panel(app: &mut App, frame: &mut Frame, area: Rect, panel: Panel, title:
     };
 
     let border_style = if active {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
@@ -69,12 +71,21 @@ fn draw_panel(app: &mut App, frame: &mut Frame, area: Rect, panel: Panel, title:
                 .as_ref()
                 .map(|p| p == &e.path)
                 .unwrap_or(false)
-                || app.soundfont.as_ref().map(|p| p == &e.path).unwrap_or(false);
+                || app
+                    .soundfont
+                    .as_ref()
+                    .map(|p| p == &e.path)
+                    .unwrap_or(false);
 
             let (icon, base) = if e.is_parent {
                 ("..", Style::default().fg(Color::Yellow))
             } else if e.is_dir {
-                ("[+]", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
+                (
+                    "[+]",
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
                 ("   ", Style::default().fg(Color::White))
             };
@@ -101,13 +112,19 @@ fn draw_panel(app: &mut App, frame: &mut Frame, area: Rect, panel: Panel, title:
         .collect();
 
     let highlight = if active {
-        Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+        Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().bg(Color::DarkGray)
     };
 
     // No highlight symbol: keeps the right-hand column aligned on every row.
-    let list = List::default().items(items).block(block).highlight_style(highlight);
+    let list = List::default()
+        .items(items)
+        .block(block)
+        .highlight_style(highlight);
 
     // ListState needs &mut, so render against the concrete browser.
     let state = match panel {
@@ -150,9 +167,17 @@ fn draw_player(app: &App, frame: &mut Frame, area: Rect) {
     let (elapsed, total) = app.times();
 
     let mut spans = vec![
-        Span::styled(state_icon, Style::default().fg(state_col).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            state_icon,
+            Style::default().fg(state_col).add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
-        Span::styled(track, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            track,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("   "),
         Span::styled(
             format!("[{} / {}]", fmt_time(elapsed), fmt_time(total)),
@@ -168,30 +193,45 @@ fn draw_player(app: &App, frame: &mut Frame, area: Rect) {
             Style::default().fg(Color::Cyan),
         ));
         if let Some((n, d)) = app.time_signature() {
-            spans.push(Span::styled(format!(" {n}/{d}"), Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                format!(" {n}/{d}"),
+                Style::default().fg(Color::DarkGray),
+            ));
         }
     }
     if let Some(bpm) = app.bpm() {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(format!("{bpm} BPM"), Style::default().fg(Color::Green)));
+        spans.push(Span::styled(
+            format!("{bpm} BPM"),
+            Style::default().fg(Color::Green),
+        ));
     }
 
     spans.extend([
         Span::raw("   "),
         Span::styled(format!("SF: {sf}"), Style::default().fg(Color::Magenta)),
         Span::raw("   "),
-        Span::styled(format!("Vol {:>3}%", app.volume), Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!("Vol {:>3}%", app.volume),
+            Style::default().fg(Color::Cyan),
+        ),
     ]);
     if app.repeat {
         spans.push(Span::styled("  ⟳", Style::default().fg(Color::Green)));
     }
     if let Some(msg) = &app.message {
         spans.push(Span::raw("   "));
-        spans.push(Span::styled(msg.clone(), Style::default().fg(Color::Yellow)));
+        spans.push(Span::styled(
+            msg.clone(),
+            Style::default().fg(Color::Yellow),
+        ));
     }
     if let Some(q) = &app.search {
         spans.push(Span::raw("   "));
-        spans.push(Span::styled(format!("/{q}"), Style::default().fg(Color::Black).bg(Color::Cyan)));
+        spans.push(Span::styled(
+            format!("/{q}"),
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
 
@@ -207,9 +247,18 @@ fn draw_hints(app: &App, frame: &mut Frame, area: Rect) {
     // When the GO prompt is open it takes over this line.
     if let Some(path) = &app.goto {
         let line = Line::from(vec![
-            Span::styled("GO: ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "GO: ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(format!("{path}█"), Style::default().fg(Color::Cyan)),
-            Span::styled("   (Tab: complete  Alt+⌫: up  Enter: go  Esc: cancel)", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "   (Tab: complete  Alt+⌫: up  Enter: go  Esc: cancel)",
+                Style::default().fg(Color::DarkGray),
+            ),
         ]);
         frame.render_widget(Paragraph::new(line), area);
         return;
@@ -225,7 +274,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     let text = vec![
         Line::from(Span::styled(
             "voxfont — keyboard shortcuts",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from("  Tab            switch between MIDI / SoundFont panels"),
@@ -344,10 +395,7 @@ fn truncate_pad(s: &str, w: usize) -> String {
         return String::new();
     }
     if len <= w {
-        let mut out = String::with_capacity(w);
-        out.push_str(s);
-        out.extend(std::iter::repeat(' ').take(w - len));
-        out
+        format!("{s:<w$}")
     } else {
         let mut out: String = s.chars().take(w.saturating_sub(1)).collect();
         out.push('…');

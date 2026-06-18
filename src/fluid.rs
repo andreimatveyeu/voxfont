@@ -18,19 +18,31 @@ enum fluid_player_t {}
 extern "C" {
     fn new_fluid_settings() -> *mut fluid_settings_t;
     fn delete_fluid_settings(s: *mut fluid_settings_t);
-    fn fluid_settings_setstr(s: *mut fluid_settings_t, name: *const c_char, val: *const c_char) -> c_int;
+    fn fluid_settings_setstr(
+        s: *mut fluid_settings_t,
+        name: *const c_char,
+        val: *const c_char,
+    ) -> c_int;
     fn fluid_settings_setint(s: *mut fluid_settings_t, name: *const c_char, val: c_int) -> c_int;
     #[allow(dead_code)]
-    fn fluid_settings_setnum(s: *mut fluid_settings_t, name: *const c_char, val: c_double) -> c_int;
+    fn fluid_settings_setnum(s: *mut fluid_settings_t, name: *const c_char, val: c_double)
+        -> c_int;
 
     fn new_fluid_synth(s: *mut fluid_settings_t) -> *mut fluid_synth_t;
     fn delete_fluid_synth(s: *mut fluid_synth_t);
-    fn fluid_synth_sfload(s: *mut fluid_synth_t, filename: *const c_char, reset_presets: c_int) -> c_int;
+    fn fluid_synth_sfload(
+        s: *mut fluid_synth_t,
+        filename: *const c_char,
+        reset_presets: c_int,
+    ) -> c_int;
     fn fluid_synth_sfunload(s: *mut fluid_synth_t, id: c_uint, reset_presets: c_int) -> c_int;
     fn fluid_synth_set_gain(s: *mut fluid_synth_t, gain: c_float);
     fn fluid_synth_system_reset(s: *mut fluid_synth_t) -> c_int;
 
-    fn new_fluid_audio_driver(s: *mut fluid_settings_t, synth: *mut fluid_synth_t) -> *mut fluid_audio_driver_t;
+    fn new_fluid_audio_driver(
+        s: *mut fluid_settings_t,
+        synth: *mut fluid_synth_t,
+    ) -> *mut fluid_audio_driver_t;
     fn delete_fluid_audio_driver(d: *mut fluid_audio_driver_t);
 
     fn new_fluid_player(synth: *mut fluid_synth_t) -> *mut fluid_player_t;

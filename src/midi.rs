@@ -36,7 +36,12 @@ pub fn parse(path: &Path) -> Option<MidiInfo> {
         let body_start = pos + 8;
         let body_end = (body_start + len).min(data.len());
         if id == b"MTrk" {
-            parse_track(&data[body_start..body_end], &mut tempos, &mut end_tick, &mut ts);
+            parse_track(
+                &data[body_start..body_end],
+                &mut tempos,
+                &mut end_tick,
+                &mut ts,
+            );
         }
         pos = body_end;
     }
@@ -48,7 +53,12 @@ pub fn parse(path: &Path) -> Option<MidiInfo> {
         0.0
     };
 
-    Some(MidiInfo { division, duration_secs, ts_num, ts_den })
+    Some(MidiInfo {
+        division,
+        duration_secs,
+        ts_num,
+        ts_den,
+    })
 }
 
 fn parse_track(

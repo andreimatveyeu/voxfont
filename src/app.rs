@@ -339,7 +339,10 @@ impl App {
     }
 
     fn elapsed_secs(&self) -> f64 {
-        let live = self.play_started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let live = self
+            .play_started
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
         self.accumulated_secs + live
     }
 
@@ -404,7 +407,11 @@ impl App {
         match candidates.len() {
             0 => {}
             1 => {
-                self.goto = Some(format!("{}{}", &input[..start], candidates[0].replacement()));
+                self.goto = Some(format!(
+                    "{}{}",
+                    &input[..start],
+                    candidates[0].replacement()
+                ));
             }
             n => {
                 if let Some(lcp) = longest_common_prefix(&candidates) {

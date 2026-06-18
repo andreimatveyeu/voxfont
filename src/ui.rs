@@ -1,0 +1,356 @@
+//! ratatui rendering: two browser panels above a player bar.
+
+use crate::app::{file_name, App, Panel, PlayState};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
+    Frame,
+};
+
+pub fn draw(f: &mut App, frame: &mut Frame) {
+    let area = frame.area();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),    // panels
+            Constraint::Length(4), // player bar
+            Constraint::Length(1), // key hints
+        ])
+        .split(area);
+
+    let panels = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[0]);
+
+    draw_panel(f, frame, panels[0], Panel::Midi, "MIDI files");
+    draw_panel(f, frame, panels[1], Panel::Sf2, "SoundFonts");
+    draw_player(f, frame, rows[1]);
+    draw_hints(f, frame, rows[2]);
+
+    if f.show_help {
+        draw_help(frame, area);
+    }
+}
+
+fn draw_panel(app: &mut App, frame: &mut Frame, area: Rect, panel: Panel, title: &str) {
+    let active = app.active == panel;
+    let browser = match panel {
+        Panel::Midi => &app.midi,
+        Panel::Sf2 => &app.sf2,
+    };
+
+    let border_style = if active {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let dir = browser.dir.to_string_lossy();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(Span::styled(
+            format!(" {title} — {dir} "),
+            Style::default().fg(if active { Color::Cyan } else { Color::Gray }),
+        ));
+
+    // Inner width available for one row (panel width minus the two borders).
+    let inner_w = area.width.saturating_sub(2) as usize;
+
+    let items: Vec<ListItem> = browser
+        .entries
+        .iter()
+        .map(|e| {
+            let playing = app
+                .now_playing
+                .as_ref()
+                .map(|p| p == &e.path)
+                .unwrap_or(false)
+                || app.soundfont.as_ref().map(|p| p == &e.path).unwrap_or(false);
+
+            let (icon, base) = if e.is_parent {
+                ("..", Style::default().fg(Color::Yellow))
+            } else if e.is_dir {
+                ("[+]", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
+            } else {
+                ("   ", Style::default().fg(Color::White))
+            };
+
+            let style = if playing {
+                base.fg(Color::Green).add_modifier(Modifier::BOLD)
+            } else {
+                base
+            };
+            let marker = if playing { "♪ " } else { "  " };
+
+            // Right-hand column: SoundFont size or MIDI duration.
+            let right = if e.is_dir {
+                String::new()
+            } else {
+                match panel {
+                    Panel::Sf2 => human_size(e.size),
+                    Panel::Midi => e.duration.map(fmt_hms).unwrap_or_default(),
+                }
+            };
+
+            ListItem::new(row_line(marker, icon, &e.name, style, &right, inner_w))
+        })
+        .collect();
+
+    let highlight = if active {
+        Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().bg(Color::DarkGray)
+    };
+
+    // No highlight symbol: keeps the right-hand column aligned on every row.
+    let list = List::default().items(items).block(block).highlight_style(highlight);
+
+    // ListState needs &mut, so render against the concrete browser.
+    let state = match panel {
+        Panel::Midi => &mut app.midi.state,
+        Panel::Sf2 => &mut app.sf2.state,
+    };
+    frame.render_stateful_widget(list, area, state);
+}
+
+fn draw_player(app: &App, frame: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(" Player ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
+
+    let (state_icon, state_col) = match app.state {
+        PlayState::Playing => ("▶ PLAY ", Color::Green),
+        PlayState::Paused => ("⏸ PAUSE", Color::Yellow),
+        PlayState::Stopped => ("⏹ STOP ", Color::Red),
+    };
+
+    let track = app
+        .now_playing
+        .as_ref()
+        .map(|p| file_name(p))
+        .unwrap_or_else(|| "—".to_string());
+    let sf = app
+        .soundfont
+        .as_ref()
+        .map(|p| file_name(p))
+        .unwrap_or_else(|| "none".to_string());
+
+    let (elapsed, total) = app.times();
+
+    let mut spans = vec![
+        Span::styled(state_icon, Style::default().fg(state_col).add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(track, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::raw("   "),
+        Span::styled(
+            format!("[{} / {}]", fmt_time(elapsed), fmt_time(total)),
+            Style::default().fg(Color::Gray),
+        ),
+    ];
+
+    // Bar:beat · time signature · tempo (only while a track is loaded).
+    if let Some((bar, beat)) = app.bar_beat() {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            format!("♪ {bar}:{beat}"),
+            Style::default().fg(Color::Cyan),
+        ));
+        if let Some((n, d)) = app.time_signature() {
+            spans.push(Span::styled(format!(" {n}/{d}"), Style::default().fg(Color::DarkGray)));
+        }
+    }
+    if let Some(bpm) = app.bpm() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(format!("{bpm} BPM"), Style::default().fg(Color::Green)));
+    }
+
+    spans.extend([
+        Span::raw("   "),
+        Span::styled(format!("SF: {sf}"), Style::default().fg(Color::Magenta)),
+        Span::raw("   "),
+        Span::styled(format!("Vol {:>3}%", app.volume), Style::default().fg(Color::Cyan)),
+    ]);
+    if app.repeat {
+        spans.push(Span::styled("  ⟳", Style::default().fg(Color::Green)));
+    }
+    if let Some(msg) = &app.message {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(msg.clone(), Style::default().fg(Color::Yellow)));
+    }
+    if let Some(q) = &app.search {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(format!("/{q}"), Style::default().fg(Color::Black).bg(Color::Cyan)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
+
+    let ratio = app.progress();
+    let gauge = Gauge::default()
+        .gauge_style(Style::default().fg(state_col).bg(Color::Black))
+        .ratio(ratio)
+        .label(format!("{:.0}%", ratio * 100.0));
+    frame.render_widget(gauge, rows[1]);
+}
+
+fn draw_hints(app: &App, frame: &mut Frame, area: Rect) {
+    // When the GO prompt is open it takes over this line.
+    if let Some(path) = &app.goto {
+        let line = Line::from(vec![
+            Span::styled("GO: ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{path}█"), Style::default().fg(Color::Cyan)),
+            Span::styled("   (Tab: complete  Alt+⌫: up  Enter: go  Esc: cancel)", Style::default().fg(Color::DarkGray)),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    let hint = "Tab panels  Enter play/load  Space pause  s stop  ←/→ seek  n/b next/prev  </> vol  i go  / search  h help  q quit";
+    frame.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+        area,
+    );
+}
+
+fn draw_help(frame: &mut Frame, area: Rect) {
+    let text = vec![
+        Line::from(Span::styled(
+            "voxfont — keyboard shortcuts",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("  Tab            switch between MIDI / SoundFont panels"),
+        Line::from("  ↑ ↓ PgUp PgDn  move cursor    Home/End  first/last"),
+        Line::from("  Enter          enter dir · play MIDI · load SoundFont"),
+        Line::from("  U              go up a directory"),
+        Line::from("  i              go to directory (Tab completes)"),
+        Line::from("  Space / p      pause / resume"),
+        Line::from("  s              stop"),
+        Line::from("  ← →            seek 5s    [ ]  seek 30s"),
+        Line::from("  n / b          next / previous MIDI in folder"),
+        Line::from("  < >            volume -1 / +1     , .  volume -5 / +5"),
+        Line::from("  M-1..M-9       volume 10%..90%"),
+        Line::from("  R              toggle repeat      X  toggle auto-next"),
+        Line::from("  H              toggle hidden files"),
+        Line::from("  / or g         search in panel    r  reload panel"),
+        Line::from("  h / ?          this help          q / Q  quit"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  press any key to close",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let w = 60u16.min(area.width.saturating_sub(2));
+    let h = (text.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Help ");
+    frame.render_widget(
+        Paragraph::new(text).block(block).wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn fmt_time(secs: f64) -> String {
+    if !secs.is_finite() || secs <= 0.0 {
+        return "00:00".to_string();
+    }
+    let s = secs as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    } else {
+        format!("{:02}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// Duration label for the file list: m:ss, or h:mm:ss past an hour.
+fn fmt_hms(secs: f64) -> String {
+    if !secs.is_finite() || secs <= 0.0 {
+        return String::new();
+    }
+    let s = secs.round() as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// Human-readable byte size (e.g. "6.4M", "275M").
+fn human_size(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut f = n as f64;
+    let mut i = 0;
+    while f >= 1024.0 && i < UNITS.len() - 1 {
+        f /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n}B")
+    } else if f < 10.0 {
+        format!("{:.1}{}", f, UNITS[i])
+    } else {
+        format!("{:.0}{}", f, UNITS[i])
+    }
+}
+
+/// Build one list row: a 2-col marker, the "icon name" left field, and a
+/// right-aligned column (size/duration). Columns stay aligned because no
+/// highlight symbol shifts the rows.
+fn row_line<'a>(
+    marker: &'a str,
+    icon: &str,
+    name: &str,
+    name_style: Style,
+    right: &str,
+    inner_w: usize,
+) -> Line<'a> {
+    let left = format!("{icon} {name}");
+    if right.is_empty() {
+        return Line::from(vec![Span::raw(marker), Span::styled(left, name_style)]);
+    }
+    let right_w = right.chars().count();
+    // Budget for the left field = width − marker(2) − right − gap(1).
+    let avail = inner_w.saturating_sub(2 + right_w + 1);
+    Line::from(vec![
+        Span::raw(marker),
+        Span::styled(truncate_pad(&left, avail), name_style),
+        Span::raw(" "),
+        Span::styled(right.to_string(), Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+/// Truncate (with an ellipsis) or right-pad `s` to exactly `w` display columns.
+fn truncate_pad(s: &str, w: usize) -> String {
+    let len = s.chars().count();
+    if w == 0 {
+        return String::new();
+    }
+    if len <= w {
+        let mut out = String::with_capacity(w);
+        out.push_str(s);
+        out.extend(std::iter::repeat(' ').take(w - len));
+        out
+    } else {
+        let mut out: String = s.chars().take(w.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}

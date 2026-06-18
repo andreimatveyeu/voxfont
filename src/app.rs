@@ -1,0 +1,472 @@
+//! Application state and the controller logic that ties the two browser panels
+//! to the fluidsynth player.
+
+use crate::browser::Browser;
+use crate::fluid::Synth;
+use crate::midi::{self, MidiInfo};
+use rustyline::completion::{longest_common_prefix, Candidate, FilenameCompleter};
+use std::path::PathBuf;
+use std::time::Instant;
+
+pub const MIDI_EXTS: &[&str] = &["mid", "midi", "kar", "rmi"];
+pub const SF2_EXTS: &[&str] = &["sf2", "sf3"];
+
+#[derive(PartialEq, Clone, Copy)]
+pub enum Panel {
+    Midi,
+    Sf2,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+pub enum PlayState {
+    Stopped,
+    Playing,
+    Paused,
+}
+
+pub struct App {
+    pub midi: Browser,
+    pub sf2: Browser,
+    pub active: Panel,
+    pub synth: Synth,
+
+    pub state: PlayState,
+    pub now_playing: Option<PathBuf>,
+    pub soundfont: Option<PathBuf>,
+    /// Parsed metadata (division, time signature, duration) of the current track.
+    pub cur_info: Option<MidiInfo>,
+
+    pub volume: u8, // 0..=100
+    pub repeat: bool,
+    pub auto_next: bool,
+
+    pub message: Option<String>,
+    /// Active incremental-search query for the focused panel, if in search mode.
+    pub search: Option<String>,
+    /// Active "go to directory" input buffer, if in goto mode.
+    pub goto: Option<String>,
+    pub show_help: bool,
+    pub quit: bool,
+
+    // Wall-clock elapsed tracking (robust across pause/seek without needing the
+    // file's PPQ division). Used only for the time readout, not the progress bar.
+    play_started: Option<Instant>,
+    accumulated_secs: f64,
+}
+
+impl App {
+    pub fn new(midi_dir: PathBuf, sf2_dir: PathBuf) -> Result<App, String> {
+        let (mut synth, warn) = Synth::new()?;
+        let volume = 60u8;
+        synth.set_gain(volume_to_gain(volume));
+
+        Ok(App {
+            midi: Browser::new(midi_dir, MIDI_EXTS, true),
+            sf2: Browser::new(sf2_dir, SF2_EXTS, false),
+            active: Panel::Midi,
+            synth,
+            state: PlayState::Stopped,
+            now_playing: None,
+            soundfont: None,
+            cur_info: None,
+            volume,
+            repeat: false,
+            auto_next: true,
+            message: warn,
+            search: None,
+            goto: None,
+            show_help: false,
+            quit: false,
+            play_started: None,
+            accumulated_secs: 0.0,
+        })
+    }
+
+    pub fn active_browser(&mut self) -> &mut Browser {
+        match self.active {
+            Panel::Midi => &mut self.midi,
+            Panel::Sf2 => &mut self.sf2,
+        }
+    }
+
+    pub fn toggle_panel(&mut self) {
+        self.active = match self.active {
+            Panel::Midi => Panel::Sf2,
+            Panel::Sf2 => Panel::Midi,
+        };
+    }
+
+    /// Enter directory or act on the selected file depending on the panel.
+    pub fn activate_selection(&mut self) {
+        let is_dir = self
+            .active_browser()
+            .selected()
+            .map(|e| e.is_dir)
+            .unwrap_or(false);
+        if is_dir {
+            self.active_browser().enter_dir();
+            return;
+        }
+        let path = match self.active_browser().selected() {
+            Some(e) => e.path.clone(),
+            None => return,
+        };
+        match self.active {
+            Panel::Sf2 => self.load_soundfont(path),
+            Panel::Midi => self.play_path(path),
+        }
+    }
+
+    pub fn load_soundfont(&mut self, path: PathBuf) {
+        match self.synth.load_soundfont(&path) {
+            Ok(()) => {
+                let name = file_name(&path);
+                self.soundfont = Some(path);
+                self.message = Some(format!("SoundFont loaded: {name}"));
+                self.save_state();
+            }
+            Err(e) => self.message = Some(e),
+        }
+    }
+
+    /// Persist the current directories and loaded SoundFont for next launch.
+    pub fn save_state(&self) {
+        crate::state::save(&crate::state::State {
+            midi_dir: Some(self.midi.dir.clone()),
+            sf2_dir: Some(self.sf2.dir.clone()),
+            soundfont: self.soundfont.clone(),
+        });
+    }
+
+    pub fn play_path(&mut self, path: PathBuf) {
+        if !self.synth.has_soundfont() {
+            self.message =
+                Some("No SoundFont loaded — pick one in the right panel (Tab, then Enter)".into());
+            return;
+        }
+        match self.synth.play(&path, self.repeat) {
+            Ok(()) => {
+                self.message = None;
+                self.cur_info = midi::parse(&path);
+                self.now_playing = Some(path);
+                self.state = PlayState::Playing;
+                self.play_started = Some(Instant::now());
+                self.accumulated_secs = 0.0;
+            }
+            Err(e) => self.message = Some(e),
+        }
+    }
+
+    pub fn toggle_pause(&mut self) {
+        match self.state {
+            PlayState::Playing => {
+                self.synth.pause();
+                self.accumulate();
+                self.play_started = None;
+                self.state = PlayState::Paused;
+            }
+            PlayState::Paused => {
+                self.synth.resume();
+                self.play_started = Some(Instant::now());
+                self.state = PlayState::Playing;
+            }
+            PlayState::Stopped => {}
+        }
+    }
+
+    pub fn stop(&mut self) {
+        if self.state == PlayState::Stopped {
+            return;
+        }
+        self.synth.stop();
+        self.state = PlayState::Stopped;
+        self.play_started = None;
+        self.accumulated_secs = 0.0;
+    }
+
+    /// Seek by a number of seconds (positive or negative).
+    pub fn seek_seconds(&mut self, secs: i32) {
+        if self.state == PlayState::Stopped {
+            return;
+        }
+        let tps = self.ticks_per_second().unwrap_or(0.0);
+        let delta = if tps > 0.0 {
+            (secs as f64 * tps) as i32
+        } else if let Some((_, total)) = self.synth.position() {
+            // Fall back to ~2% of the song per "second-ish" step.
+            ((secs as f64) * (total as f64) / 50.0) as i32
+        } else {
+            0
+        };
+        self.synth.seek_ticks(delta);
+        // Nudge the wall-clock estimate so the readout tracks the seek.
+        self.accumulate();
+        self.accumulated_secs = (self.accumulated_secs + secs as f64).max(0.0);
+        if self.state == PlayState::Playing {
+            self.play_started = Some(Instant::now());
+        }
+    }
+
+    pub fn next_file(&mut self) {
+        self.step_file(true);
+    }
+
+    pub fn prev_file(&mut self) {
+        self.step_file(false);
+    }
+
+    fn step_file(&mut self, forward: bool) {
+        let cur = match &self.now_playing {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        if let Some(next) = self.midi.neighbour_file(&cur, forward) {
+            self.play_path(next);
+        }
+    }
+
+    pub fn volume_delta(&mut self, delta: i32) {
+        let v = (self.volume as i32 + delta).clamp(0, 100) as u8;
+        self.volume = v;
+        self.synth.set_gain(volume_to_gain(v));
+    }
+
+    pub fn set_volume(&mut self, v: u8) {
+        self.volume = v.min(100);
+        self.synth.set_gain(volume_to_gain(self.volume));
+    }
+
+    pub fn toggle_repeat(&mut self) {
+        self.repeat = !self.repeat;
+        self.synth.set_repeat(self.repeat);
+        self.message = Some(format!("Repeat: {}", on_off(self.repeat)));
+    }
+
+    pub fn toggle_auto_next(&mut self) {
+        self.auto_next = !self.auto_next;
+        self.message = Some(format!("AutoNext: {}", on_off(self.auto_next)));
+    }
+
+    pub fn toggle_hidden(&mut self) {
+        let show = !self.active_browser().show_hidden;
+        // Keep both panels consistent.
+        self.midi.show_hidden = show;
+        self.sf2.show_hidden = show;
+        self.midi.refresh();
+        self.sf2.refresh();
+    }
+
+    /// Called once per UI tick: detect end-of-song and auto-advance/repeat.
+    pub fn tick(&mut self) {
+        if self.state != PlayState::Playing {
+            return;
+        }
+        if let Some((cur, total)) = self.synth.position() {
+            let finished = total > 0 && cur >= total && !self.synth.is_playing_status();
+            if finished {
+                if self.repeat {
+                    if let Some(p) = self.now_playing.clone() {
+                        self.play_path(p);
+                    }
+                } else if self.auto_next {
+                    let cur_path = self.now_playing.clone();
+                    let next = cur_path
+                        .as_ref()
+                        .and_then(|p| self.midi.neighbour_file(p, true));
+                    match next {
+                        Some(p) => self.play_path(p),
+                        None => self.stop(),
+                    }
+                } else {
+                    self.stop();
+                }
+            }
+        }
+    }
+
+    /// Progress fraction 0.0..=1.0 from the player's tick counters.
+    pub fn progress(&self) -> f64 {
+        match self.synth.position() {
+            Some((cur, total)) if total > 0 => (cur as f64 / total as f64).clamp(0.0, 1.0),
+            _ => 0.0,
+        }
+    }
+
+    /// (elapsed_secs, total_secs). Total is exact from the parsed file when
+    /// available, otherwise estimated from elapsed time and progress.
+    pub fn times(&self) -> (f64, f64) {
+        let elapsed = self.elapsed_secs();
+        let total = match self.cur_info {
+            Some(info) if info.duration_secs > 0.0 => info.duration_secs,
+            _ => {
+                let frac = self.progress();
+                if frac > 0.001 {
+                    elapsed / frac
+                } else {
+                    0.0
+                }
+            }
+        };
+        (elapsed, total)
+    }
+
+    /// Current musical position as (bar, beat), both 1-based, if computable.
+    pub fn bar_beat(&self) -> Option<(u32, u32)> {
+        let info = self.cur_info?;
+        if info.division == 0 {
+            return None;
+        }
+        let (cur, _) = self.synth.position()?;
+        let cur = cur.max(0) as u64;
+        let div = info.division as u64;
+        // Ticks per beat, where a "beat" is one denominator note.
+        let ticks_per_beat = (div * 4 / info.ts_den.max(1) as u64).max(1);
+        let beats_per_bar = info.ts_num.max(1) as u64;
+        let ticks_per_bar = ticks_per_beat * beats_per_bar;
+        let bar = cur / ticks_per_bar + 1;
+        let beat = (cur % ticks_per_bar) / ticks_per_beat + 1;
+        Some((bar as u32, beat as u32))
+    }
+
+    /// Live playback tempo in BPM, if available.
+    pub fn bpm(&self) -> Option<i32> {
+        self.synth.bpm()
+    }
+
+    /// Time signature as (numerator, denominator), if known.
+    pub fn time_signature(&self) -> Option<(u8, u8)> {
+        self.cur_info.map(|i| (i.ts_num, i.ts_den))
+    }
+
+    fn elapsed_secs(&self) -> f64 {
+        let live = self.play_started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+        self.accumulated_secs + live
+    }
+
+    fn accumulate(&mut self) {
+        if let Some(t) = self.play_started {
+            self.accumulated_secs += t.elapsed().as_secs_f64();
+        }
+    }
+
+    // --- "go to directory" prompt (the `i` key) --------------------------------
+
+    /// Open the GO prompt, pre-filled with the active panel's directory.
+    pub fn start_goto(&mut self) {
+        let mut d = self.active_browser().dir.to_string_lossy().to_string();
+        if !d.ends_with('/') {
+            d.push('/');
+        }
+        self.goto = Some(d);
+    }
+
+    pub fn goto_push(&mut self, c: char) {
+        if let Some(g) = self.goto.as_mut() {
+            g.push(c);
+        }
+    }
+
+    pub fn goto_backspace(&mut self) {
+        if let Some(g) = self.goto.as_mut() {
+            g.pop();
+        }
+    }
+
+    /// Delete the last path component (back to the previous slash).
+    pub fn goto_delete_component(&mut self) {
+        if let Some(g) = self.goto.as_mut() {
+            if g.ends_with('/') {
+                g.pop();
+            }
+            match g.rfind('/') {
+                Some(i) => g.truncate(i + 1), // keep the slash
+                None => g.clear(),
+            }
+        }
+    }
+
+    pub fn goto_cancel(&mut self) {
+        self.goto = None;
+    }
+
+    /// Tab-complete the path in the GO buffer using rustyline's filesystem
+    /// completer (handles the directory scan, matching and common-prefix logic).
+    pub fn goto_complete(&mut self) {
+        let input = match self.goto.clone() {
+            Some(i) => i,
+            None => return,
+        };
+        let completer = FilenameCompleter::new();
+        let (start, candidates) = match completer.complete_path(&input, input.len()) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        match candidates.len() {
+            0 => {}
+            1 => {
+                self.goto = Some(format!("{}{}", &input[..start], candidates[0].replacement()));
+            }
+            n => {
+                if let Some(lcp) = longest_common_prefix(&candidates) {
+                    self.goto = Some(format!("{}{}", &input[..start], lcp));
+                }
+                self.message = Some(format!("{n} matches"));
+            }
+        }
+    }
+
+    /// Navigate the active panel to the entered directory.
+    pub fn goto_submit(&mut self) {
+        let input = match self.goto.take() {
+            Some(i) => i,
+            None => return,
+        };
+        let path = PathBuf::from(expand_tilde(input.trim()));
+        if path.is_dir() {
+            self.message = None;
+            self.active_browser().set_dir(path);
+        } else {
+            self.message = Some(format!("Not a directory: {}", input.trim()));
+        }
+    }
+
+    fn ticks_per_second(&self) -> Option<f64> {
+        let (cur, _) = self.synth.position()?;
+        let elapsed = self.elapsed_secs();
+        if elapsed > 0.5 && cur > 0 {
+            Some(cur as f64 / elapsed)
+        } else {
+            None
+        }
+    }
+}
+
+fn volume_to_gain(v: u8) -> f32 {
+    // Map 0..100% to a comfortable 0.0..0.8 gain (fluidsynth default is 0.2).
+    (v as f32 / 100.0) * 0.8
+}
+
+fn on_off(b: bool) -> &'static str {
+    if b {
+        "ON"
+    } else {
+        "OFF"
+    }
+}
+
+fn expand_tilde(s: &str) -> String {
+    let home = || std::env::var("HOME").unwrap_or_default();
+    if s == "~" {
+        home()
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        format!("{}/{}", home(), rest)
+    } else {
+        s.to_string()
+    }
+}
+
+pub fn file_name(p: &std::path::Path) -> String {
+    p.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| p.to_string_lossy().to_string())
+}

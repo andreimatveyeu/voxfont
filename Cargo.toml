@@ -1,0 +1,18 @@
+[package]
+name = "voxfont"
+version = "0.1.0"
+edition = "2021"
+description = "Console MIDI/SoundFont player with a two-panel interface"
+authors = ["Andrei Matveyeu"]
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "voxfont"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30"
+rustyline = "18.0.0"
+
+[profile.release]
+opt-level = 2

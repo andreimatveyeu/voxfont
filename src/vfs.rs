@@ -392,7 +392,6 @@ fn base_name(p: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use tempfile::tempdir;
     use zip::write::SimpleFileOptions;
 

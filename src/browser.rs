@@ -267,7 +267,10 @@ impl Browser {
 
     /// The first playable (non-directory) file in this directory, if any.
     pub fn first_file(&self) -> Option<Location> {
-        self.entries.iter().find(|e| !e.is_dir).map(|e| e.loc.clone())
+        self.entries
+            .iter()
+            .find(|e| !e.is_dir)
+            .map(|e| e.loc.clone())
     }
 }
 
@@ -316,7 +319,12 @@ mod tests {
         fs::write(p.join("note.txt"), b"nope").unwrap();
         fs::write(p.join(".hidden.mid"), b"hidden").unwrap();
 
-        let b = Browser::new_at(Location::Fs(p.to_path_buf()), &["mid", "midi"], false, false);
+        let b = Browser::new_at(
+            Location::Fs(p.to_path_buf()),
+            &["mid", "midi"],
+            false,
+            false,
+        );
         // Dirs first (alphabetical), then files (alphabetical); .txt and the
         // dotfile are excluded.
         assert_eq!(names(&b), ["asub", "zsub", "a.midi", "b.mid", "c.mid"]);
@@ -420,12 +428,7 @@ mod tests {
         make_zip(&d.path().join("z.zip"), &["inner/song.mid"]);
 
         // Filesystem file: cursor lands on the saved location.
-        let mut b = Browser::new_at(
-            Location::Fs(d.path().to_path_buf()),
-            &["mid"],
-            false,
-            true,
-        );
+        let mut b = Browser::new_at(Location::Fs(d.path().to_path_buf()), &["mid"], false, true);
         b.select_loc(&Location::Fs(d.path().join("b.mid")));
         assert_eq!(b.selected().unwrap().name, "b.mid");
 
@@ -458,7 +461,11 @@ mod tests {
         let mut b = Browser::new_at(Location::Fs(d.path().to_path_buf()), &["mid"], false, true);
 
         // The archive appears in the filesystem listing as a directory.
-        let zi = b.entries.iter().position(|e| e.name == "songs.zip").unwrap();
+        let zi = b
+            .entries
+            .iter()
+            .position(|e| e.name == "songs.zip")
+            .unwrap();
         assert!(b.entries[zi].is_dir);
         b.state.select(Some(zi));
         b.enter_dir();

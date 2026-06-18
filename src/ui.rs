@@ -71,11 +71,7 @@ fn draw_panel(app: &mut App, frame: &mut Frame, area: Rect, panel: Panel, title:
                 .as_ref()
                 .map(|p| p == &e.loc)
                 .unwrap_or(false)
-                || app
-                    .soundfont
-                    .as_ref()
-                    .map(|p| p == &e.loc)
-                    .unwrap_or(false);
+                || app.soundfont.as_ref().map(|p| p == &e.loc).unwrap_or(false);
 
             let (icon, base) = if e.is_parent {
                 ("..", Style::default().fg(Color::Yellow))

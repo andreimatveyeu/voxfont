@@ -592,5 +592,4 @@ mod tests {
         };
         assert_eq!(bar_beat_at(100, &smpte), None);
     }
-
 }

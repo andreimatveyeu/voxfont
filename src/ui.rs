@@ -53,13 +53,22 @@ fn draw_panel(app: &mut App, frame: &mut Frame, area: Rect, panel: Panel, title:
     };
 
     let dir = browser.dir_display();
+    let n = browser.item_count();
+    // Item count sits on the bottom border (right-aligned) instead of taking a
+    // whole row of its own.
+    let count = Line::from(Span::styled(
+        format!(" {n} item{} ", if n == 1 { "" } else { "s" }),
+        Style::default().fg(if active { Color::Cyan } else { Color::DarkGray }),
+    ))
+    .right_aligned();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(Span::styled(
             format!(" {title} — {dir} "),
             Style::default().fg(if active { Color::Cyan } else { Color::Gray }),
-        ));
+        ))
+        .title_bottom(count);
 
     // Inner width available for one row (panel width minus the two borders).
     let inner_w = area.width.saturating_sub(2) as usize;

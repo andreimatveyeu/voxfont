@@ -132,8 +132,7 @@ impl Synth {
             };
             let mut driver = std::ptr::null_mut();
             for cand in &candidates {
-                if let (Ok(k), Ok(v)) =
-                    (CString::new("audio.driver"), CString::new(cand.as_str()))
+                if let (Ok(k), Ok(v)) = (CString::new("audio.driver"), CString::new(cand.as_str()))
                 {
                     fluid_settings_setstr(settings, k.as_ptr(), v.as_ptr());
                 }

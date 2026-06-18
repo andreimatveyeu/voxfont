@@ -1,6 +1,6 @@
 [package]
 name = "voxfont"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Console MIDI/SoundFont player with a two-panel interface"
 authors = ["Andrei Matveyeu"]

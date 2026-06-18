@@ -117,6 +117,18 @@ impl Synth {
                 }
             }
 
+            // Autoconnect is opt-in. By default fluidsynth must NOT wire its
+            // outputs to the JACK/PipeWire physical playback ports — the user
+            // routes them in their patchbay. Set VOXFONT_JACK_AUTOCONNECT=1
+            // (or true/yes/on) to let it connect automatically on startup.
+            let autoconnect = matches!(
+                std::env::var("VOXFONT_JACK_AUTOCONNECT").as_deref(),
+                Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+            );
+            if let Ok(k) = CString::new("audio.jack.autoconnect") {
+                fluid_settings_setint(settings, k.as_ptr(), autoconnect as c_int);
+            }
+
             let synth = new_fluid_synth(settings);
             if synth.is_null() {
                 delete_fluid_settings(settings);

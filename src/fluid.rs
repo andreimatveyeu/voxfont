@@ -103,18 +103,18 @@ impl Synth {
                 return Err("new_fluid_settings failed".into());
             }
 
-            // Let the user force a driver (alsa/pulseaudio/pipewire/jack/...),
-            // otherwise fluidsynth picks its platform default.
-            if let Ok(drv) = std::env::var("VOXFONT_AUDIO_DRIVER") {
-                if let Ok(k) = CString::new("audio.driver") {
-                    if let Ok(v) = CString::new(drv) {
-                        fluid_settings_setstr(settings, k.as_ptr(), v.as_ptr());
-                    }
-                }
-            }
             // Quiet fluidsynth's own logging so it can't corrupt the TUI.
             if let Ok(k) = CString::new("synth.verbose") {
                 fluid_settings_setint(settings, k.as_ptr(), 0);
+            }
+
+            // Name the JACK client. PipeWire implements JACK, so when we use the
+            // jack driver the graph shows a clean "voxfont" node instead of the
+            // ALSA driver's auto-generated "PipeWire ALSA [voxfont]".
+            if let Ok(k) = CString::new("audio.jack.id") {
+                if let Ok(v) = CString::new("voxfont") {
+                    fluid_settings_setstr(settings, k.as_ptr(), v.as_ptr());
+                }
             }
 
             let synth = new_fluid_synth(settings);
@@ -123,7 +123,25 @@ impl Synth {
                 return Err("new_fluid_synth failed".into());
             }
 
-            let driver = new_fluid_audio_driver(settings, synth);
+            // Pick the audio driver. An explicit VOXFONT_AUDIO_DRIVER override
+            // wins; otherwise prefer JACK (a clean client name on PipeWire/JACK)
+            // and fall back to the usual Linux drivers if it isn't available.
+            let candidates: Vec<String> = match std::env::var("VOXFONT_AUDIO_DRIVER") {
+                Ok(drv) => vec![drv],
+                Err(_) => vec!["jack".into(), "pulseaudio".into(), "alsa".into()],
+            };
+            let mut driver = std::ptr::null_mut();
+            for cand in &candidates {
+                if let (Ok(k), Ok(v)) =
+                    (CString::new("audio.driver"), CString::new(cand.as_str()))
+                {
+                    fluid_settings_setstr(settings, k.as_ptr(), v.as_ptr());
+                }
+                driver = new_fluid_audio_driver(settings, synth);
+                if !driver.is_null() {
+                    break;
+                }
+            }
             let warning = if driver.is_null() {
                 Some("audio driver failed to start — playback will be silent (try VOXFONT_AUDIO_DRIVER=alsa|pulseaudio|pipewire)".to_string())
             } else {

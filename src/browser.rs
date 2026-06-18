@@ -190,7 +190,11 @@ impl Browser {
     /// Enter the directory (or archive) at the cursor.
     pub fn enter_dir(&mut self) {
         if let Some(e) = self.selected() {
-            if e.is_dir {
+            if e.is_parent {
+                // Entering ".." is going up: land the cursor on the directory we
+                // came from rather than leaving it parked on the new "..".
+                self.go_up();
+            } else if e.is_dir {
                 let target = e.loc.clone();
                 self.set_loc(target);
             }
@@ -406,6 +410,24 @@ mod tests {
         assert_eq!(b.dir, Location::Fs(d.path().join("sub")));
         b.go_up();
         assert_eq!(b.dir, Location::Fs(d.path().to_path_buf()));
+    }
+
+    #[test]
+    fn entering_parent_lands_on_previous_dir() {
+        let d = tempdir().unwrap();
+        fs::create_dir(d.path().join("sub")).unwrap();
+        let mut b = Browser::new_at(Location::Fs(d.path().to_path_buf()), &["mid"], false, false);
+        let idx = b.entries.iter().position(|e| e.name == "sub").unwrap();
+        b.state.select(Some(idx));
+        b.enter_dir();
+        assert_eq!(b.dir, Location::Fs(d.path().join("sub")));
+
+        // The cursor is on ".."; entering it should go up and highlight "sub",
+        // not leave the cursor parked on the new "..".
+        assert!(b.selected().unwrap().is_parent);
+        b.enter_dir();
+        assert_eq!(b.dir, Location::Fs(d.path().to_path_buf()));
+        assert_eq!(b.selected().unwrap().name, "sub");
     }
 
     /// Build a zip with the given members (dirs end in '/') at `path`.

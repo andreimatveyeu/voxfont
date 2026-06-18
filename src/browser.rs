@@ -220,3 +220,128 @@ impl Browser {
         files.get(next).map(|e| e.path.clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Browser;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn names(b: &Browser) -> Vec<String> {
+        b.entries
+            .iter()
+            .filter(|e| !e.is_parent)
+            .map(|e| e.name.clone())
+            .collect()
+    }
+
+    /// A minimal valid SMF: PPQ 480, 120 BPM, one quarter long (0.5 s).
+    fn minimal_midi() -> Vec<u8> {
+        let mut v = b"MThd".to_vec();
+        v.extend_from_slice(&6u32.to_be_bytes());
+        v.extend_from_slice(&1u16.to_be_bytes()); // format
+        v.extend_from_slice(&1u16.to_be_bytes()); // ntracks
+        v.extend_from_slice(&480u16.to_be_bytes()); // division
+        let events: &[u8] = &[
+            0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20, // tempo 120
+            0x83, 0x60, 0xFF, 0x2F, 0x00, // delta 480, end of track
+        ];
+        v.extend_from_slice(b"MTrk");
+        v.extend_from_slice(&(events.len() as u32).to_be_bytes());
+        v.extend_from_slice(events);
+        v
+    }
+
+    #[test]
+    fn filters_sorts_and_marks_parent() {
+        let d = tempdir().unwrap();
+        let p = d.path();
+        fs::create_dir(p.join("zsub")).unwrap();
+        fs::create_dir(p.join("asub")).unwrap();
+        fs::write(p.join("b.mid"), b"x").unwrap();
+        fs::write(p.join("a.midi"), b"xx").unwrap();
+        fs::write(p.join("c.mid"), b"xxx").unwrap();
+        fs::write(p.join("note.txt"), b"nope").unwrap();
+        fs::write(p.join(".hidden.mid"), b"hidden").unwrap();
+
+        let b = Browser::new(p.to_path_buf(), &["mid", "midi"], false);
+        // Dirs first (alphabetical), then files (alphabetical); .txt and the
+        // dotfile are excluded.
+        assert_eq!(names(&b), ["asub", "zsub", "a.midi", "b.mid", "c.mid"]);
+        assert!(b.entries[0].is_parent, "first entry should be '..'");
+    }
+
+    #[test]
+    fn hidden_toggle_reveals_dotfiles() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join(".secret.mid"), b"x").unwrap();
+        fs::write(d.path().join("plain.mid"), b"x").unwrap();
+        let mut b = Browser::new(d.path().to_path_buf(), &["mid"], false);
+        assert_eq!(names(&b), ["plain.mid"]);
+        b.show_hidden = true;
+        b.refresh();
+        assert_eq!(names(&b), [".secret.mid", "plain.mid"]);
+    }
+
+    #[test]
+    fn populates_size_and_duration() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("song.mid"), minimal_midi()).unwrap();
+        let b = Browser::new(d.path().to_path_buf(), &["mid"], true);
+        let e = b.entries.iter().find(|e| e.name == "song.mid").unwrap();
+        assert_eq!(e.size, minimal_midi().len() as u64);
+        let dur = e.duration.expect("duration should be computed");
+        assert!((dur - 0.5).abs() < 1e-6, "{dur}");
+    }
+
+    #[test]
+    fn duration_skipped_when_disabled() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("song.mid"), minimal_midi()).unwrap();
+        let b = Browser::new(d.path().to_path_buf(), &["mid"], false);
+        let e = b.entries.iter().find(|e| e.name == "song.mid").unwrap();
+        assert!(e.duration.is_none());
+    }
+
+    #[test]
+    fn neighbour_file_walks_files_only() {
+        let d = tempdir().unwrap();
+        for n in ["a.mid", "b.mid", "c.mid"] {
+            fs::write(d.path().join(n), b"x").unwrap();
+        }
+        let b = Browser::new(d.path().to_path_buf(), &["mid"], false);
+        let (a, bb, c) = (
+            d.path().join("a.mid"),
+            d.path().join("b.mid"),
+            d.path().join("c.mid"),
+        );
+        assert_eq!(b.neighbour_file(&bb, true), Some(c.clone()));
+        assert_eq!(b.neighbour_file(&bb, false), Some(a.clone()));
+        assert_eq!(b.neighbour_file(&a, false), None);
+        assert_eq!(b.neighbour_file(&c, true), None);
+    }
+
+    #[test]
+    fn search_jumps_to_match() {
+        let d = tempdir().unwrap();
+        for n in ["alpha.mid", "bravo.mid", "charlie.mid"] {
+            fs::write(d.path().join(n), b"x").unwrap();
+        }
+        let mut b = Browser::new(d.path().to_path_buf(), &["mid"], false);
+        b.search("CHAR"); // case-insensitive
+        assert_eq!(b.selected().unwrap().name, "charlie.mid");
+    }
+
+    #[test]
+    fn enter_and_go_up_navigate() {
+        let d = tempdir().unwrap();
+        fs::create_dir(d.path().join("sub")).unwrap();
+        let mut b = Browser::new(d.path().to_path_buf(), &["mid"], false);
+        let idx = b.entries.iter().position(|e| e.name == "sub").unwrap();
+        b.state.select(Some(idx));
+        b.enter_dir();
+        assert_eq!(b.dir, d.path().join("sub"));
+        b.go_up();
+        assert_eq!(b.dir, d.path().to_path_buf());
+    }
+}

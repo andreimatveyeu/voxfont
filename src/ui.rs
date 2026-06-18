@@ -402,3 +402,47 @@ fn truncate_pad(s: &str, w: usize) -> String {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_time_minutes_and_hours() {
+        assert_eq!(fmt_time(0.0), "00:00");
+        assert_eq!(fmt_time(-3.0), "00:00");
+        assert_eq!(fmt_time(7.0), "00:07");
+        assert_eq!(fmt_time(98.0), "01:38");
+        assert_eq!(fmt_time(3661.0), "1:01:01");
+        assert_eq!(fmt_time(f64::NAN), "00:00");
+    }
+
+    #[test]
+    fn fmt_hms_for_file_list() {
+        assert_eq!(fmt_hms(0.0), "");
+        assert_eq!(fmt_hms(128.0), "2:08");
+        assert_eq!(fmt_hms(89.6), "1:30"); // rounds
+        assert_eq!(fmt_hms(3725.0), "1:02:05");
+    }
+
+    #[test]
+    fn human_size_scales_units() {
+        assert_eq!(human_size(0), "0B");
+        assert_eq!(human_size(512), "512B");
+        assert_eq!(human_size(2 * 1024 + 100), "2.1K");
+        assert_eq!(human_size(8 * 1024 * 1024), "8.0M");
+        assert_eq!(human_size(148 * 1024 * 1024), "148M");
+        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0G");
+    }
+
+    #[test]
+    fn truncate_pad_pads_and_truncates() {
+        assert_eq!(truncate_pad("abc", 5), "abc  ");
+        assert_eq!(truncate_pad("abc", 3), "abc");
+        assert_eq!(truncate_pad("abcdef", 4), "abc…");
+        assert_eq!(truncate_pad("anything", 0), "");
+        // Result width is always exactly `w` columns.
+        assert_eq!(truncate_pad("hello world", 6).chars().count(), 6);
+        assert_eq!(truncate_pad("hi", 6).chars().count(), 6);
+    }
+}

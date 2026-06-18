@@ -313,19 +313,8 @@ impl App {
     /// Current musical position as (bar, beat), both 1-based, if computable.
     pub fn bar_beat(&self) -> Option<(u32, u32)> {
         let info = self.cur_info?;
-        if info.division == 0 {
-            return None;
-        }
         let (cur, _) = self.synth.position()?;
-        let cur = cur.max(0) as u64;
-        let div = info.division as u64;
-        // Ticks per beat, where a "beat" is one denominator note.
-        let ticks_per_beat = (div * 4 / info.ts_den.max(1) as u64).max(1);
-        let beats_per_bar = info.ts_num.max(1) as u64;
-        let ticks_per_bar = ticks_per_beat * beats_per_bar;
-        let bar = cur / ticks_per_bar + 1;
-        let beat = (cur % ticks_per_bar) / ticks_per_beat + 1;
-        Some((bar as u32, beat as u32))
+        bar_beat_at(cur, &info)
     }
 
     /// Live playback tempo in BPM, if available.
@@ -378,13 +367,7 @@ impl App {
     /// Delete the last path component (back to the previous slash).
     pub fn goto_delete_component(&mut self) {
         if let Some(g) = self.goto.as_mut() {
-            if g.ends_with('/') {
-                g.pop();
-            }
-            match g.rfind('/') {
-                Some(i) => g.truncate(i + 1), // keep the slash
-                None => g.clear(),
-            }
+            *g = delete_path_component(g);
         }
     }
 
@@ -476,4 +459,105 @@ pub fn file_name(p: &std::path::Path) -> String {
     p.file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| p.to_string_lossy().to_string())
+}
+
+/// Drop the last path component of `s`, keeping the trailing slash (for the GO
+/// prompt's Alt+Backspace). "/a/b/c" -> "/a/b/", "/a/b/" -> "/a/".
+fn delete_path_component(s: &str) -> String {
+    let mut s = s.to_string();
+    if s.ends_with('/') {
+        s.pop();
+    }
+    match s.rfind('/') {
+        Some(i) => s.truncate(i + 1),
+        None => s.clear(),
+    }
+    s
+}
+
+/// Pure (bar, beat) computation, both 1-based. None for SMPTE/unknown division.
+fn bar_beat_at(tick: i32, info: &MidiInfo) -> Option<(u32, u32)> {
+    if info.division == 0 {
+        return None;
+    }
+    let cur = tick.max(0) as u64;
+    let div = info.division as u64;
+    // Ticks per beat, where a "beat" is one denominator note.
+    let ticks_per_beat = (div * 4 / info.ts_den.max(1) as u64).max(1);
+    let beats_per_bar = info.ts_num.max(1) as u64;
+    let ticks_per_bar = ticks_per_beat * beats_per_bar;
+    let bar = cur / ticks_per_bar + 1;
+    let beat = (cur % ticks_per_bar) / ticks_per_beat + 1;
+    Some((bar as u32, beat as u32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volume_to_gain_maps_range() {
+        assert_eq!(volume_to_gain(0), 0.0);
+        assert!((volume_to_gain(100) - 0.8).abs() < 1e-6);
+        assert!((volume_to_gain(50) - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn delete_path_component_steps_up() {
+        assert_eq!(delete_path_component("/a/b/c"), "/a/b/");
+        assert_eq!(delete_path_component("/a/b/"), "/a/");
+        assert_eq!(delete_path_component("/a/"), "/");
+        assert_eq!(delete_path_component("/"), "");
+        assert_eq!(delete_path_component("relative"), "");
+    }
+
+    #[test]
+    fn expand_tilde_uses_home() {
+        // Independent of the environment: a plain path is unchanged.
+        assert_eq!(expand_tilde("/etc/passwd"), "/etc/passwd");
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            assert_eq!(expand_tilde("~/x"), format!("{home}/x"));
+            assert_eq!(expand_tilde("~"), home);
+        }
+    }
+
+    #[test]
+    fn bar_beat_4_4() {
+        // 480 PPQ, 4/4: ticks/beat=480, ticks/bar=1920.
+        let info = MidiInfo {
+            division: 480,
+            duration_secs: 0.0,
+            ts_num: 4,
+            ts_den: 4,
+        };
+        assert_eq!(bar_beat_at(0, &info), Some((1, 1)));
+        assert_eq!(bar_beat_at(480, &info), Some((1, 2)));
+        assert_eq!(bar_beat_at(1920, &info), Some((2, 1)));
+        assert_eq!(bar_beat_at(1920 + 960, &info), Some((2, 3)));
+    }
+
+    #[test]
+    fn bar_beat_3_4_and_smpte() {
+        let info = MidiInfo {
+            division: 480,
+            duration_secs: 0.0,
+            ts_num: 3,
+            ts_den: 4,
+        };
+        // 3/4: a bar is 3 beats = 1440 ticks.
+        assert_eq!(bar_beat_at(1440, &info), Some((2, 1)));
+        assert_eq!(bar_beat_at(480, &info), Some((1, 2)));
+
+        let smpte = MidiInfo {
+            division: 0,
+            ..info
+        };
+        assert_eq!(bar_beat_at(100, &smpte), None);
+    }
+
+    #[test]
+    fn file_name_basename() {
+        assert_eq!(file_name(std::path::Path::new("/a/b/song.mid")), "song.mid");
+    }
 }

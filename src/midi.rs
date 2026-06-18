@@ -17,11 +17,15 @@ pub struct MidiInfo {
 
 pub fn parse(path: &Path) -> Option<MidiInfo> {
     let data = std::fs::read(path).ok()?;
+    parse_bytes(&data)
+}
+
+pub fn parse_bytes(data: &[u8]) -> Option<MidiInfo> {
     if data.len() < 14 || &data[0..4] != b"MThd" {
         return None;
     }
     // Header: "MThd"(0..4) len(4..8) format(8..10) ntracks(10..12) division(12..14)
-    let raw_div = be16(&data, 12)? as i16;
+    let raw_div = be16(data, 12)? as i16;
     let division: u16 = if raw_div > 0 { raw_div as u16 } else { 0 };
 
     // (tick, microseconds-per-quarter) tempo changes, plus the last event tick.
@@ -32,7 +36,7 @@ pub fn parse(path: &Path) -> Option<MidiInfo> {
     let mut pos = 14;
     while pos + 8 <= data.len() {
         let id = &data[pos..pos + 4];
-        let len = be32(&data, pos + 4)? as usize;
+        let len = be32(data, pos + 4)? as usize;
         let body_start = pos + 8;
         let body_end = (body_start + len).min(data.len());
         if id == b"MTrk" {
@@ -165,4 +169,114 @@ fn be32(d: &[u8], i: usize) -> Option<u32> {
         *d.get(i + 2)?,
         *d.get(i + 3)?,
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mthd(format: u16, ntracks: u16, division: u16) -> Vec<u8> {
+        let mut v = b"MThd".to_vec();
+        v.extend_from_slice(&6u32.to_be_bytes());
+        v.extend_from_slice(&format.to_be_bytes());
+        v.extend_from_slice(&ntracks.to_be_bytes());
+        v.extend_from_slice(&division.to_be_bytes());
+        v
+    }
+
+    fn mtrk(events: &[u8]) -> Vec<u8> {
+        let mut v = b"MTrk".to_vec();
+        v.extend_from_slice(&(events.len() as u32).to_be_bytes());
+        v.extend_from_slice(events);
+        v
+    }
+
+    /// A single-track file with the given division (PPQ) and event bytes.
+    fn file(division: u16, events: &[u8]) -> Vec<u8> {
+        let mut v = mthd(1, 1, division);
+        v.extend(mtrk(events));
+        v
+    }
+
+    const TEMPO_120: [u8; 6] = [0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]; // 500000 us/qn
+    const TEMPO_60: [u8; 6] = [0xFF, 0x51, 0x03, 0x0F, 0x42, 0x40]; // 1000000 us/qn
+    const TS_3_4: [u8; 7] = [0xFF, 0x58, 0x04, 0x03, 0x02, 0x18, 0x08];
+    const EOT: [u8; 3] = [0xFF, 0x2F, 0x00];
+
+    #[test]
+    fn reads_division_from_offset_12_not_format() {
+        // format=1 sits at offset 8; division=480 at offset 12. A naive reader
+        // of offset 8 would return 1 here — this guards that regression.
+        let mut ev = vec![0x00];
+        ev.extend_from_slice(&TS_3_4);
+        ev.push(0x00);
+        ev.extend_from_slice(&EOT);
+        let info = parse_bytes(&file(480, &ev)).expect("should parse");
+        assert_eq!(info.division, 480);
+        assert_eq!((info.ts_num, info.ts_den), (3, 4));
+    }
+
+    #[test]
+    fn duration_uses_division_and_tempo() {
+        // 120 BPM, then 480 ticks (one quarter at PPQ 480) to end => 0.5 s.
+        let mut ev = vec![0x00];
+        ev.extend_from_slice(&TEMPO_120);
+        ev.extend_from_slice(&[0x83, 0x60]); // delta = 480 (varlen)
+        ev.extend_from_slice(&EOT);
+        let info = parse_bytes(&file(480, &ev)).unwrap();
+        assert!(
+            (info.duration_secs - 0.5).abs() < 1e-6,
+            "{}",
+            info.duration_secs
+        );
+    }
+
+    #[test]
+    fn duration_honours_tempo_changes() {
+        // [0,480) at 120 BPM = 0.5 s, then [480,960) at 60 BPM = 1.0 s => 1.5 s.
+        let mut ev = vec![0x00];
+        ev.extend_from_slice(&TEMPO_120);
+        ev.extend_from_slice(&[0x83, 0x60]); // delta 480
+        ev.extend_from_slice(&TEMPO_60);
+        ev.extend_from_slice(&[0x83, 0x60]); // delta 480
+        ev.extend_from_slice(&EOT);
+        let info = parse_bytes(&file(480, &ev)).unwrap();
+        assert!(
+            (info.duration_secs - 1.5).abs() < 1e-6,
+            "{}",
+            info.duration_secs
+        );
+    }
+
+    #[test]
+    fn handles_running_status() {
+        // Two note-ons, the second using running status (no repeated 0x90).
+        let ev = [
+            0x00, 0x90, 0x3C, 0x40, // note on, delta 0
+            0x60, 0x3E, 0x40, // running status, delta 96
+            0x00, 0xFF, 0x2F, 0x00, // end of track
+        ];
+        let info = parse_bytes(&file(480, &ev)).unwrap();
+        // No tempo => default 120 BPM; end tick 96 => 96/480 * 0.5 s = 0.1 s.
+        assert!(
+            (info.duration_secs - 0.1).abs() < 1e-6,
+            "{}",
+            info.duration_secs
+        );
+    }
+
+    #[test]
+    fn defaults_time_signature_to_4_4() {
+        let mut ev = vec![0x00];
+        ev.extend_from_slice(&EOT);
+        let info = parse_bytes(&file(480, &ev)).unwrap();
+        assert_eq!((info.ts_num, info.ts_den), (4, 4));
+    }
+
+    #[test]
+    fn rejects_non_midi() {
+        assert!(parse_bytes(b"").is_none());
+        assert!(parse_bytes(b"not a midi file at all").is_none());
+        assert!(parse_bytes(b"RIFF\0\0\0\0WAVE").is_none());
+    }
 }

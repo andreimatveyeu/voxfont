@@ -157,6 +157,43 @@ impl App {
         }
     }
 
+    // --- incremental filter/search (the `/` key) ------------------------------
+
+    /// Push the active panel's filter to match the current search buffer.
+    fn apply_search(&mut self) {
+        let q = self.search.clone().unwrap_or_default();
+        self.active_browser().set_filter(&q);
+    }
+
+    pub fn search_push(&mut self, c: char) {
+        if let Some(q) = self.search.as_mut() {
+            q.push(c);
+        }
+        self.apply_search();
+    }
+
+    pub fn search_backspace(&mut self) {
+        if let Some(q) = self.search.as_mut() {
+            q.pop();
+        }
+        self.apply_search();
+    }
+
+    /// Leave search mode, clearing the filter and restoring the full listing.
+    pub fn search_cancel(&mut self) {
+        self.search = None;
+        self.active_browser().set_filter("");
+    }
+
+    /// Accept the highlighted match: act on it (play / load / enter dir), then
+    /// leave search mode and restore the full listing (cursor stays on the item
+    /// when it is still present).
+    pub fn search_accept(&mut self) {
+        self.search = None;
+        self.activate_selection();
+        self.active_browser().set_filter("");
+    }
+
     pub fn load_soundfont(&mut self, loc: Location) {
         // Archive members are extracted to a temp file first, since the FFI
         // loads SoundFonts by filename only.

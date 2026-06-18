@@ -9,6 +9,7 @@ use ratatui::widgets::ListState;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone)]
 pub struct Entry {
     pub name: String,
     pub loc: Location,
@@ -23,7 +24,13 @@ pub struct Entry {
 
 pub struct Browser {
     dir: Location,
+    /// The full directory/archive listing, before the search filter.
+    all: Vec<Entry>,
+    /// Visible listing: `all` narrowed to entries matching `filter`. The UI and
+    /// all cursor operations work on this, so navigation stays within matches.
     pub entries: Vec<Entry>,
+    /// Active case-insensitive name filter; empty means show everything.
+    filter: String,
     pub state: ListState,
     /// Lower-case extensions (without dot) that should be shown as files.
     exts: Vec<String>,
@@ -50,7 +57,9 @@ impl Browser {
     ) -> Browser {
         let mut b = Browser {
             dir,
+            all: Vec::new(),
             entries: Vec::new(),
+            filter: String::new(),
             state: ListState::default(),
             exts: exts.iter().map(|s| s.to_lowercase()).collect(),
             show_hidden: false,
@@ -124,14 +133,43 @@ impl Browser {
         entries.extend(dirs);
         entries.extend(files);
 
-        self.entries = entries;
-        // Keep the selection valid.
-        let sel = self.state.selected().unwrap_or(0);
+        self.all = entries;
+        self.apply_filter();
+    }
+
+    /// Rebuild the visible `entries` from `all` by applying the current filter,
+    /// keeping the cursor on the same item when it survives (otherwise the top).
+    fn apply_filter(&mut self) {
+        let prev = self.selected().map(|e| e.loc.clone());
+        self.entries = if self.filter.is_empty() {
+            self.all.clone()
+        } else {
+            self.all
+                .iter()
+                .filter(|e| e.name.to_lowercase().contains(&self.filter))
+                .cloned()
+                .collect()
+        };
         if self.entries.is_empty() {
             self.state.select(None);
         } else {
-            self.state.select(Some(sel.min(self.entries.len() - 1)));
+            let idx = prev
+                .and_then(|loc| self.entries.iter().position(|e| e.loc == loc))
+                .unwrap_or(0);
+            self.state.select(Some(idx));
         }
+    }
+
+    /// Set the case-insensitive name filter (empty clears it), narrowing the
+    /// visible list live without re-reading the directory.
+    pub fn set_filter(&mut self, query: &str) {
+        self.filter = query.to_lowercase();
+        self.apply_filter();
+    }
+
+    /// True while a search filter is narrowing the list.
+    pub fn is_filtered(&self) -> bool {
+        !self.filter.is_empty()
     }
 
     fn matches_ext(&self, name: &str) -> bool {
@@ -150,10 +188,16 @@ impl Browser {
         self.dir.display()
     }
 
-    /// Number of real entries in the current directory/archive, excluding the
-    /// synthetic ".." parent.
+    /// Number of currently visible entries, excluding the synthetic ".." parent.
+    /// With a filter active this is the match count.
     pub fn item_count(&self) -> usize {
         self.entries.iter().filter(|e| !e.is_parent).count()
+    }
+
+    /// Total entries in the directory/archive (ignoring any filter), excluding
+    /// the synthetic ".." parent.
+    pub fn total_count(&self) -> usize {
+        self.all.iter().filter(|e| !e.is_parent).count()
     }
 
     /// The current directory location (for session persistence).
@@ -192,6 +236,8 @@ impl Browser {
 
     fn set_loc(&mut self, loc: Location) {
         self.dir = loc;
+        // A fresh directory always lists in full; drop any active filter.
+        self.filter.clear();
         self.state.select(Some(0));
         self.refresh();
     }
@@ -261,24 +307,11 @@ impl Browser {
         }
     }
 
-    /// Jump to the first entry whose name contains `query` (case-insensitive).
-    pub fn search(&mut self, query: &str) {
-        if query.is_empty() {
-            return;
-        }
-        let q = query.to_lowercase();
-        if let Some(i) = self
-            .entries
-            .iter()
-            .position(|e| e.name.to_lowercase().contains(&q))
-        {
-            self.state.select(Some(i));
-        }
-    }
-
-    /// The next/previous playable (non-dir) file relative to `loc`.
+    /// The next/previous playable (non-dir) file relative to `loc`. Walks the
+    /// full listing, not the filtered view, so auto-advance is unaffected by a
+    /// transient search filter.
     pub fn neighbour_file(&self, loc: &Location, forward: bool) -> Option<Location> {
-        let files: Vec<&Entry> = self.entries.iter().filter(|e| !e.is_dir).collect();
+        let files: Vec<&Entry> = self.all.iter().filter(|e| !e.is_dir).collect();
         let cur = files.iter().position(|e| &e.loc == loc)?;
         let next = if forward {
             cur + 1
@@ -290,10 +323,7 @@ impl Browser {
 
     /// The first playable (non-directory) file in this directory, if any.
     pub fn first_file(&self) -> Option<Location> {
-        self.entries
-            .iter()
-            .find(|e| !e.is_dir)
-            .map(|e| e.loc.clone())
+        self.all.iter().find(|e| !e.is_dir).map(|e| e.loc.clone())
     }
 }
 
@@ -402,14 +432,55 @@ mod tests {
     }
 
     #[test]
-    fn search_jumps_to_match() {
+    fn filter_narrows_list_and_selects_first_match() {
         let d = tempdir().unwrap();
-        for n in ["alpha.mid", "bravo.mid", "charlie.mid"] {
+        for n in ["alpha.mid", "bravo.mid", "brazil.mid", "charlie.mid"] {
             fs::write(d.path().join(n), b"x").unwrap();
         }
         let mut b = Browser::new_at(Location::Fs(d.path().to_path_buf()), &["mid"], false, false);
-        b.search("CHAR"); // case-insensitive
-        assert_eq!(b.selected().unwrap().name, "charlie.mid");
+        assert_eq!(b.total_count(), 4);
+
+        b.set_filter("BR"); // case-insensitive
+        assert!(b.is_filtered());
+        assert_eq!(names(&b), ["bravo.mid", "brazil.mid"]);
+        assert_eq!(b.item_count(), 2);
+        assert_eq!(b.total_count(), 4);
+        // Cursor lands on the first match and can move within the filtered set.
+        assert_eq!(b.selected().unwrap().name, "bravo.mid");
+        b.move_down(1);
+        assert_eq!(b.selected().unwrap().name, "brazil.mid");
+
+        // Clearing restores the full list, keeping the cursor on the same item.
+        b.set_filter("");
+        assert!(!b.is_filtered());
+        assert_eq!(b.item_count(), 4);
+        assert_eq!(b.selected().unwrap().name, "brazil.mid");
+    }
+
+    #[test]
+    fn filter_with_no_match_clears_selection() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("song.mid"), b"x").unwrap();
+        let mut b = Browser::new_at(Location::Fs(d.path().to_path_buf()), &["mid"], false, false);
+        b.set_filter("zzz");
+        assert!(b.selected().is_none());
+        assert_eq!(b.item_count(), 0);
+    }
+
+    #[test]
+    fn changing_directory_drops_the_filter() {
+        let d = tempdir().unwrap();
+        fs::create_dir(d.path().join("sub")).unwrap();
+        fs::write(d.path().join("sub").join("inner.mid"), b"x").unwrap();
+        let mut b = Browser::new_at(Location::Fs(d.path().to_path_buf()), &["mid"], false, false);
+        b.set_filter("zzz"); // hides everything
+        let idx = b.all.iter().position(|e| e.name == "sub").unwrap();
+        // Re-select "sub" in the unfiltered list to enter it.
+        b.set_filter("");
+        b.state.select(Some(idx));
+        b.enter_dir();
+        assert!(!b.is_filtered(), "entering a directory clears the filter");
+        assert_eq!(names(&b), ["inner.mid"]);
     }
 
     #[test]

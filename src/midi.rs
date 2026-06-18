@@ -205,8 +205,8 @@ mod tests {
 
     #[test]
     fn reads_division_from_offset_12_not_format() {
-        // format=1 sits at offset 8; division=480 at offset 12. A naive reader
-        // of offset 8 would return 1 here — this guards that regression.
+        // format=1 sits at offset 8; division=480 at offset 12. Reading offset 8
+        // by mistake would yield 1, so assert the division comes from offset 12.
         let mut ev = vec![0x00];
         ev.extend_from_slice(&TS_3_4);
         ev.push(0x00);

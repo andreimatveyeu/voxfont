@@ -37,8 +37,10 @@ pub struct App {
     pub cur_info: Option<MidiInfo>,
 
     pub volume: u8, // 0..=100
+    /// Repeat mode: loop the current track (next off) or the directory (next on).
     pub repeat: bool,
-    pub auto_next: bool,
+    /// Next mode: advance to the next file in the directory when one finishes.
+    pub next_mode: bool,
 
     pub message: Option<String>,
     /// Active incremental-search query for the focused panel, if in search mode.
@@ -71,7 +73,7 @@ impl App {
             cur_info: None,
             volume,
             repeat: false,
-            auto_next: true,
+            next_mode: true,
             message: warn,
             search: None,
             goto: None,
@@ -144,7 +146,7 @@ impl App {
                 Some("No SoundFont loaded — pick one in the right panel (Tab, then Enter)".into());
             return;
         }
-        match self.synth.play(&path, self.repeat) {
+        match self.synth.play(&path) {
             Ok(()) => {
                 self.message = None;
                 self.cur_info = midi::parse(&path);
@@ -207,24 +209,6 @@ impl App {
         }
     }
 
-    pub fn next_file(&mut self) {
-        self.step_file(true);
-    }
-
-    pub fn prev_file(&mut self) {
-        self.step_file(false);
-    }
-
-    fn step_file(&mut self, forward: bool) {
-        let cur = match &self.now_playing {
-            Some(p) => p.clone(),
-            None => return,
-        };
-        if let Some(next) = self.midi.neighbour_file(&cur, forward) {
-            self.play_path(next);
-        }
-    }
-
     pub fn volume_delta(&mut self, delta: i32) {
         let v = (self.volume as i32 + delta).clamp(0, 100) as u8;
         self.volume = v;
@@ -238,13 +222,12 @@ impl App {
 
     pub fn toggle_repeat(&mut self) {
         self.repeat = !self.repeat;
-        self.synth.set_repeat(self.repeat);
         self.message = Some(format!("Repeat: {}", on_off(self.repeat)));
     }
 
-    pub fn toggle_auto_next(&mut self) {
-        self.auto_next = !self.auto_next;
-        self.message = Some(format!("AutoNext: {}", on_off(self.auto_next)));
+    pub fn toggle_next_mode(&mut self) {
+        self.next_mode = !self.next_mode;
+        self.message = Some(format!("Next: {}", on_off(self.next_mode)));
     }
 
     pub fn toggle_hidden(&mut self) {
@@ -256,31 +239,48 @@ impl App {
         self.sf2.refresh();
     }
 
-    /// Called once per UI tick: detect end-of-song and auto-advance/repeat.
+    /// Called once per UI tick: on end-of-song, apply the next/repeat modes.
+    ///
+    /// | next | repeat | on finish                              |
+    /// |------|--------|----------------------------------------|
+    /// | off  | off    | stop                                   |
+    /// | off  | on     | replay current track (loop track)      |
+    /// | on   | off    | play next; stop after the last file    |
+    /// | on   | on     | play next; wrap to first (loop dir)    |
     pub fn tick(&mut self) {
         if self.state != PlayState::Playing {
             return;
         }
-        if let Some((cur, total)) = self.synth.position() {
-            let finished = total > 0 && cur >= total && !self.synth.is_playing_status();
-            if finished {
-                if self.repeat {
-                    if let Some(p) = self.now_playing.clone() {
-                        self.play_path(p);
-                    }
-                } else if self.auto_next {
-                    let cur_path = self.now_playing.clone();
-                    let next = cur_path
-                        .as_ref()
-                        .and_then(|p| self.midi.neighbour_file(p, true));
-                    match next {
-                        Some(p) => self.play_path(p),
-                        None => self.stop(),
-                    }
-                } else {
-                    self.stop();
-                }
+        // Use the player's DONE status, not the tick counter: fluidsynth can
+        // report completion at a tick below (or above) the nominal total.
+        if !self.synth.is_finished() {
+            return;
+        }
+
+        let cur = match self.now_playing.clone() {
+            Some(p) => p,
+            None => {
+                self.stop();
+                return;
             }
+        };
+
+        if self.next_mode {
+            if let Some(next) = self.midi.neighbour_file(&cur, true) {
+                self.play_path(next);
+            } else if self.repeat {
+                // End of directory: loop back to the first file.
+                match self.midi.first_file() {
+                    Some(first) => self.play_path(first),
+                    None => self.stop(),
+                }
+            } else {
+                self.stop();
+            }
+        } else if self.repeat {
+            self.play_path(cur); // loop the current track
+        } else {
+            self.stop();
         }
     }
 

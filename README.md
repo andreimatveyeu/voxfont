@@ -91,17 +91,24 @@ voxfont --selftest /path/to/font.sf2 /path/to/song.mid
 | `Space` / `p` | pause / resume |
 | `s` | stop |
 | `← →` | seek 5s · `[` `]` seek 30s |
-| `n` / `b` | next / previous MIDI in the folder |
+| `n` | toggle **next** mode (auto-play the next file when one ends) |
+| `r` | toggle **repeat** mode |
 | `<` `>` | volume −1 / +1 · `,` `.` volume −5 / +5 |
 | `Alt`+`1`…`9` | set volume 10%…90% |
-| `R` | toggle repeat · `X` toggle auto-next |
-| `H` | toggle hidden files · `r` reload panel |
+| `H` | toggle hidden files · `Ctrl`+`r` reload panel |
 | `/` or `g` | incremental search in the active panel |
 | `h` / `?` | help · `q` / `Q` quit |
 
 A SoundFont must be loaded (right panel → `Enter`) before MIDI playback works.
-When a track ends, auto-next plays the next MIDI in the folder (toggle with `X`);
-repeat (`R`) loops the current track instead.
+The **next** and **repeat** modes (shown on the player bar) combine to control
+what happens when a track ends:
+
+| next | repeat | behaviour |
+| --- | --- | --- |
+| off | off | play the file, then stop |
+| off | on | loop the current track |
+| on | off | play through the directory, then stop |
+| on | on | loop the whole directory |
 
 ## License
 

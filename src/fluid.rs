@@ -63,6 +63,7 @@ extern "C" {
 type fluid_log_fn = extern "C" fn(level: c_int, message: *const c_char, data: *mut c_void);
 
 const FLUID_PLAYER_PLAYING: c_int = 1;
+const FLUID_PLAYER_DONE: c_int = 3;
 
 /// No-op log sink so fluidsynth never writes to stderr and corrupts the TUI.
 extern "C" fn silent_log(_level: c_int, _message: *const c_char, _data: *mut c_void) {}
@@ -163,8 +164,9 @@ impl Synth {
         self.sf_id.is_some()
     }
 
-    /// Start playing a MIDI file from the beginning.
-    pub fn play(&mut self, midi: &Path, repeat: bool) -> Result<(), String> {
+    /// Start playing a MIDI file from the beginning. Always plays through once;
+    /// repeat / next-track behaviour is handled by the caller on end-of-song.
+    pub fn play(&mut self, midi: &Path) -> Result<(), String> {
         let c = cstr(midi)?;
         unsafe {
             self.drop_player();
@@ -176,7 +178,7 @@ impl Synth {
                 delete_fluid_player(p);
                 return Err(format!("cannot load MIDI: {}", midi.display()));
             }
-            fluid_player_set_loop(p, if repeat { -1 } else { 1 });
+            fluid_player_set_loop(p, 1);
             fluid_player_play(p);
             self.player = p;
             self.paused_tick = 0;
@@ -239,14 +241,6 @@ impl Synth {
         }
     }
 
-    pub fn set_repeat(&mut self, repeat: bool) {
-        if !self.player.is_null() {
-            unsafe {
-                fluid_player_set_loop(self.player, if repeat { -1 } else { 1 });
-            }
-        }
-    }
-
     /// gain: 0.0 (silent) .. ~1.0 (default fluidsynth gain is 0.2).
     pub fn set_gain(&mut self, gain: f32) {
         unsafe {
@@ -281,6 +275,16 @@ impl Synth {
             return false;
         }
         unsafe { fluid_player_get_status(self.player) == FLUID_PLAYER_PLAYING }
+    }
+
+    /// True once the current song has played to its end (status DONE). This is
+    /// the reliable end-of-song signal — the tick counter can stop short of, or
+    /// overshoot, the reported total, so don't rely on it for completion.
+    pub fn is_finished(&self) -> bool {
+        if self.player.is_null() {
+            return false;
+        }
+        unsafe { fluid_player_get_status(self.player) == FLUID_PLAYER_DONE }
     }
 
     unsafe fn drop_player(&mut self) {

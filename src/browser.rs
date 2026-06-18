@@ -219,6 +219,14 @@ impl Browser {
         };
         files.get(next).map(|e| e.path.clone())
     }
+
+    /// The first playable (non-directory) file in this directory, if any.
+    pub fn first_file(&self) -> Option<PathBuf> {
+        self.entries
+            .iter()
+            .find(|e| !e.is_dir)
+            .map(|e| e.path.clone())
+    }
 }
 
 #[cfg(test)]

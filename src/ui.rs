@@ -216,9 +216,17 @@ fn draw_player(app: &App, frame: &mut Frame, area: Rect) {
             Style::default().fg(Color::Cyan),
         ),
     ]);
-    if app.repeat {
-        spans.push(Span::styled("  ⟳", Style::default().fg(Color::Green)));
-    }
+    // Playback-mode badges: lit when the mode is on, dim when off.
+    let on = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+    let off = Style::default().fg(Color::DarkGray);
+    spans.push(Span::raw("   "));
+    spans.push(Span::styled(" Next ", if app.next_mode { on } else { off }));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(" Rep ", if app.repeat { on } else { off }));
+
     if let Some(msg) = &app.message {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
@@ -263,7 +271,7 @@ fn draw_hints(app: &App, frame: &mut Frame, area: Rect) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    let hint = "Tab panels  Enter play/load  Space pause  s stop  ←/→ seek  n/b next/prev  </> vol  i go  / search  h help  q quit";
+    let hint = "Tab panels  Enter play/load  Space pause  s stop  ←/→ seek  n next-mode  r repeat  </> vol  i go  / search  h help  q quit";
     frame.render_widget(
         Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
         area,
@@ -287,12 +295,12 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  Space / p      pause / resume"),
         Line::from("  s              stop"),
         Line::from("  ← →            seek 5s    [ ]  seek 30s"),
-        Line::from("  n / b          next / previous MIDI in folder"),
+        Line::from("  n              next mode: auto-play next file when done"),
+        Line::from("  r              repeat mode: loop the track or directory"),
         Line::from("  < >            volume -1 / +1     , .  volume -5 / +5"),
         Line::from("  M-1..M-9       volume 10%..90%"),
-        Line::from("  R              toggle repeat      X  toggle auto-next"),
-        Line::from("  H              toggle hidden files"),
-        Line::from("  / or g         search in panel    r  reload panel"),
+        Line::from("  H              toggle hidden files   ^r  reload panel"),
+        Line::from("  / or g         search in panel"),
         Line::from("  h / ?          this help          q / Q  quit"),
         Line::from(""),
         Line::from(Span::styled(

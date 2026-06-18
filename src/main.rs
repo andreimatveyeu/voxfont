@@ -107,7 +107,7 @@ fn selftest(sf2: Option<&String>, midi: Option<&String>) -> Result<(), Box<dyn s
     } else {
         println!("midi: parse failed");
     }
-    synth.play(std::path::Path::new(midi), false)?;
+    synth.play(std::path::Path::new(midi))?;
     println!("playing: {midi}");
 
     sleep(Duration::from_millis(1500));
@@ -211,24 +211,19 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('[') => app.seek_seconds(-30),
         KeyCode::Char(']') => app.seek_seconds(30),
 
-        KeyCode::Char('n') => app.next_file(),
-        KeyCode::Char('b') => app.prev_file(),
-
         KeyCode::Char('<') => app.volume_delta(-1),
         KeyCode::Char('>') => app.volume_delta(1),
         KeyCode::Char(',') => app.volume_delta(-5),
         KeyCode::Char('.') => app.volume_delta(5),
         KeyCode::Char(d @ '1'..='9') if alt => app.set_volume((d as u8 - b'0') * 10),
 
-        KeyCode::Char('R') => app.toggle_repeat(),
-        KeyCode::Char('X') => app.toggle_auto_next(),
+        // Playback modes.
+        KeyCode::Char('n') => app.toggle_next_mode(),
+        KeyCode::Char('r') if !ctrl => app.toggle_repeat(),
         KeyCode::Char('H') => app.toggle_hidden(),
 
-        // r / Ctrl-r both reload the active panel.
-        KeyCode::Char('r') => {
-            let _ = ctrl;
-            app.active_browser().refresh();
-        }
+        // Ctrl-r reloads the active panel.
+        KeyCode::Char('r') if ctrl => app.active_browser().refresh(),
 
         KeyCode::Char('/') | KeyCode::Char('g') => app.search = Some(String::new()),
 

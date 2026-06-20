@@ -114,26 +114,23 @@ impl App {
         };
     }
 
-    /// Jump the active panel's cursor to what it is currently playing/loading:
-    /// the playing MIDI file in the MIDI panel, the loaded SoundFont in the
-    /// SoundFont panel. Navigates into the right directory or archive first.
+    /// Jump both panels' cursors to what they are currently playing/loading:
+    /// the playing MIDI file in the MIDI panel and the loaded SoundFont in the
+    /// SoundFont panel. Each panel navigates into the right directory or archive
+    /// first. Panels with nothing to reveal are left untouched.
     pub fn goto_current(&mut self) {
-        let loc = match self.active {
-            Panel::Midi => self.now_playing.clone(),
-            Panel::Sf2 => self.soundfont.clone(),
+        let midi = self.now_playing.clone();
+        let sf2 = self.soundfont.clone();
+        if let Some(loc) = &midi {
+            self.midi.reveal(loc);
+        }
+        if let Some(loc) = &sf2 {
+            self.sf2.reveal(loc);
+        }
+        self.message = match (midi.is_some(), sf2.is_some()) {
+            (false, false) => Some("Nothing playing or loaded".into()),
+            _ => None,
         };
-        let Some(loc) = loc else {
-            self.message = Some(
-                match self.active {
-                    Panel::Midi => "Nothing playing",
-                    Panel::Sf2 => "No SoundFont loaded",
-                }
-                .into(),
-            );
-            return;
-        };
-        self.active_browser().reveal(&loc);
-        self.message = None;
     }
 
     /// Enter directory or act on the selected file depending on the panel.
@@ -632,6 +629,43 @@ mod tests {
         assert_eq!(bar_beat_at(480, &info), Some((1, 2)));
         assert_eq!(bar_beat_at(1920, &info), Some((2, 1)));
         assert_eq!(bar_beat_at(1920 + 960, &info), Some((2, 3)));
+    }
+
+    #[test]
+    fn goto_current_reveals_both_panels() {
+        use crate::vfs::Location;
+        use std::fs;
+
+        let midi_dir = tempfile::tempdir().unwrap();
+        let sf_dir = tempfile::tempdir().unwrap();
+        // Put each "current" item in a subdirectory, so revealing it must
+        // navigate the panel rather than just move the cursor.
+        let msub = midi_dir.path().join("sub");
+        let ssub = sf_dir.path().join("fonts");
+        fs::create_dir(&msub).unwrap();
+        fs::create_dir(&ssub).unwrap();
+        fs::write(msub.join("song.mid"), b"x").unwrap();
+        fs::write(ssub.join("piano.sf2"), b"x").unwrap();
+
+        let mut app = App::new(
+            Location::Fs(midi_dir.path().to_path_buf()),
+            Location::Fs(sf_dir.path().to_path_buf()),
+            None,
+        )
+        .expect("app init");
+
+        let playing = Location::Fs(msub.join("song.mid"));
+        let font = Location::Fs(ssub.join("piano.sf2"));
+        app.now_playing = Some(playing.clone());
+        app.soundfont = Some(font.clone());
+
+        // A single G reveals the current item in *both* panels, regardless of
+        // which one is active.
+        app.goto_current();
+
+        assert_eq!(app.midi.selected().map(|e| e.loc.clone()), Some(playing));
+        assert_eq!(app.sf2.selected().map(|e| e.loc.clone()), Some(font));
+        assert!(app.message.is_none());
     }
 
     #[test]

@@ -57,14 +57,20 @@ FLUIDSYNTH_LIB_DIR=/path/to/lib cargo build --release
 ## Run
 
 ```sh
-voxfont [MIDI_DIR] [SOUNDFONT_DIR]
+voxfont [-R <driver>] [MIDI_DIR [SOUNDFONT_DIR]]
 ```
 
+- `-R`, `--driver <driver>` — audio backend, `jack` (default) or `alsa`. When
+  given it is used verbatim, with no fallback. When omitted, voxfont uses the
+  `VOXFONT_AUDIO_DRIVER` env override if set, otherwise tries jack, pulseaudio,
+  then alsa in turn.
 - `MIDI_DIR` — starting directory for the left (MIDI) panel.
 - `SOUNDFONT_DIR` — starting directory for the right (SoundFont) panel.
 
-Both are optional. The precedence is: command-line argument, then the directory
-remembered from the previous session, then `$HOME`.
+The directories are optional. The precedence is: command-line argument, then the
+directory remembered from the previous session, then `$HOME`.
+
+Run `voxfont --help` for the full usage summary.
 
 ### Saved session
 

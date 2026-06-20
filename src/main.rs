@@ -17,6 +17,110 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+const USAGE: &str = "\
+voxfont — console MIDI/SoundFont player
+
+Usage:
+    voxfont [-R <driver>] [MIDI_DIR [SOUNDFONT_DIR]]
+    voxfont --selftest <soundfont.sf2> <file.mid>
+    voxfont -h | --help
+
+Options:
+    -R, --driver <driver>   Audio backend: jack (default) or alsa.
+
+Positional arguments (both optional):
+    MIDI_DIR                Starting directory for the MIDI panel.
+    SOUNDFONT_DIR           Starting directory for the SoundFont panel.
+
+When a directory is omitted, the one remembered from the previous session is
+used, falling back to $HOME.";
+
+/// Parsed command line. `driver` is `None` unless `-R` was given.
+struct Cli {
+    driver: Option<String>,
+    midi_dir: Option<String>,
+    sf2_dir: Option<String>,
+}
+
+/// Hand-rolled parser (no external dependency, matching the project's lean
+/// dependency policy). `-R/--driver` takes jack|alsa; up to two positionals are
+/// the MIDI and SoundFont directories. Returns `Err(message)` on misuse.
+fn parse_args(args: &[String]) -> Result<Cli, String> {
+    let mut driver = None;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "-R" | "--driver" => {
+                let val = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{arg} requires a value (jack or alsa)"))?;
+                match val.as_str() {
+                    "jack" | "alsa" => driver = Some(val.clone()),
+                    other => {
+                        return Err(format!("unknown driver '{other}' (expected jack or alsa)"))
+                    }
+                }
+                i += 2;
+            }
+            // Allow `-R=jack` / `--driver=alsa` too.
+            _ if arg.starts_with("-R=") || arg.starts_with("--driver=") => {
+                let val = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
+                match val {
+                    "jack" | "alsa" => driver = Some(val.to_string()),
+                    other => {
+                        return Err(format!("unknown driver '{other}' (expected jack or alsa)"))
+                    }
+                }
+                i += 1;
+            }
+            "--" => {
+                positional.extend(args[i + 1..].iter().cloned());
+                break;
+            }
+            other if other.starts_with('-') && other != "-" => {
+                return Err(format!("unknown option '{other}'"));
+            }
+            _ => {
+                positional.push(arg.clone());
+                i += 1;
+            }
+        }
+    }
+    if positional.len() > 2 {
+        return Err(
+            "too many positional arguments (expected at most MIDI_DIR and SOUNDFONT_DIR)".into(),
+        );
+    }
+    let mut it = positional.into_iter();
+    Ok(Cli {
+        driver,
+        midi_dir: it.next(),
+        sf2_dir: it.next(),
+    })
+}
+
+/// Turn a directory argument into a `Location`, or `None` (pushing a warning)
+/// if it was given but is not a usable directory. `label` names the argument in
+/// the warning (e.g. "MIDI_DIR"). A missing argument yields `None` silently.
+fn validate_dir(
+    arg: Option<&String>,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> Option<vfs::Location> {
+    let p = PathBuf::from(arg?);
+    if !p.is_dir() {
+        warnings.push(format!("{label} '{}' is not a directory", p.display()));
+        None
+    } else if std::fs::read_dir(&p).is_err() {
+        warnings.push(format!("{label} '{}' is not readable", p.display()));
+        None
+    } else {
+        Some(vfs::Location::Fs(p))
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -26,14 +130,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return selftest(args.get(1), args.get(2));
     }
 
-    // Restore the previous session, then apply precedence:
-    // CLI arg > saved location > $HOME.
-    let saved = state::load();
-    let dir_arg = |a: Option<&String>| {
-        a.map(PathBuf::from)
-            .filter(|p| p.is_dir())
-            .map(vfs::Location::Fs)
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return Ok(());
+    }
+
+    let cli = match parse_args(&args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("voxfont: {e}\n\n{USAGE}");
+            std::process::exit(2);
+        }
     };
+
+    // Restore the previous session, then apply precedence:
+    // CLI arg > saved location > $HOME. A directory passed on the command line
+    // that turns out to be unusable is not fatal: we warn (via the status bar)
+    // and fall back, rather than silently dropping the argument.
+    let saved = state::load();
+    let mut warnings: Vec<String> = Vec::new();
     let saved_dir = |l: &Option<vfs::Location>| l.clone().filter(|l| l.is_openable_dir());
     let home = || {
         vfs::Location::Fs(
@@ -42,20 +157,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| PathBuf::from(".")),
         )
     };
-    let midi_dir = dir_arg(args.first())
+    let midi_dir = validate_dir(cli.midi_dir.as_ref(), "MIDI_DIR", &mut warnings)
         .or_else(|| saved_dir(&saved.midi_dir))
         .unwrap_or_else(home);
-    let sf2_dir = dir_arg(args.get(1))
+    let sf2_dir = validate_dir(cli.sf2_dir.as_ref(), "SOUNDFONT_DIR", &mut warnings)
         .or_else(|| saved_dir(&saved.sf2_dir))
         .unwrap_or_else(|| midi_dir.clone());
 
-    let mut app = match App::new(midi_dir, sf2_dir) {
+    let mut app = match App::new(midi_dir, sf2_dir, cli.driver.as_deref()) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("voxfont: failed to initialize: {e}");
             std::process::exit(1);
         }
     };
+
+    // Fold any directory-argument warnings into the existing message banner
+    // (which may already hold an audio-driver warning).
+    if !warnings.is_empty() {
+        if let Some(m) = app.message.take() {
+            warnings.push(m);
+        }
+        app.message = Some(warnings.join("; "));
+    }
 
     // Seed the remembered file (before any load, which would re-save state) and
     // put the MIDI cursor on it if it is in the opened directory.
@@ -91,7 +215,7 @@ fn selftest(sf2: Option<&String>, midi: Option<&String>) -> Result<(), Box<dyn s
     let sf2 = sf2.ok_or("usage: voxfont --selftest <soundfont.sf2> <file.mid>")?;
     let midi = midi.ok_or("usage: voxfont --selftest <soundfont.sf2> <file.mid>")?;
 
-    let (mut synth, warn) = fluid::Synth::new()?;
+    let (mut synth, warn) = fluid::Synth::new(None)?;
     if let Some(w) = warn {
         println!("warning: {w}");
     } else {
@@ -281,5 +405,80 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
         KeyCode::Backspace => app.search_backspace(),
         KeyCode::Char(c) => app.search_push(c),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_empty_to_all_none() {
+        let c = parse_args(&[]).unwrap();
+        assert!(c.driver.is_none());
+        assert!(c.midi_dir.is_none());
+        assert!(c.sf2_dir.is_none());
+    }
+
+    #[test]
+    fn parses_driver_and_two_dirs() {
+        let c = parse_args(&s(&["-R", "alsa", "/midi", "/sf2"])).unwrap();
+        assert_eq!(c.driver.as_deref(), Some("alsa"));
+        assert_eq!(c.midi_dir.as_deref(), Some("/midi"));
+        assert_eq!(c.sf2_dir.as_deref(), Some("/sf2"));
+    }
+
+    #[test]
+    fn driver_may_follow_positionals_and_use_equals() {
+        let c = parse_args(&s(&["/midi", "--driver=jack"])).unwrap();
+        assert_eq!(c.driver.as_deref(), Some("jack"));
+        assert_eq!(c.midi_dir.as_deref(), Some("/midi"));
+        assert!(c.sf2_dir.is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_driver_and_missing_value() {
+        assert!(parse_args(&s(&["-R", "oss"])).is_err());
+        assert!(parse_args(&s(&["-R"])).is_err());
+        assert!(parse_args(&s(&["--driver=oss"])).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_option_and_excess_positionals() {
+        assert!(parse_args(&s(&["--bogus"])).is_err());
+        assert!(parse_args(&s(&["a", "b", "c"])).is_err());
+    }
+
+    #[test]
+    fn double_dash_forces_positionals() {
+        let c = parse_args(&s(&["--", "-R", "x"])).unwrap();
+        assert!(c.driver.is_none());
+        assert_eq!(c.midi_dir.as_deref(), Some("-R"));
+        assert_eq!(c.sf2_dir.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn validate_dir_warns_on_missing_path_but_not_on_absent_arg() {
+        let mut w = Vec::new();
+        assert!(validate_dir(None, "MIDI_DIR", &mut w).is_none());
+        assert!(w.is_empty());
+
+        assert!(validate_dir(Some(&"/no/such/dir".to_string()), "MIDI_DIR", &mut w).is_none());
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("MIDI_DIR"));
+    }
+
+    #[test]
+    fn validate_dir_accepts_a_real_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().to_str().unwrap().to_string();
+        let mut w = Vec::new();
+        let loc = validate_dir(Some(&path), "SOUNDFONT_DIR", &mut w);
+        assert!(loc.is_some());
+        assert!(w.is_empty());
     }
 }

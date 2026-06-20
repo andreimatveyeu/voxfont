@@ -95,7 +95,12 @@ pub struct Synth {
 impl Synth {
     /// Build a synth + audio driver. Returns the synth plus an optional warning
     /// (e.g. audio driver failed to start, so playback will be silent).
-    pub fn new() -> Result<(Synth, Option<String>), String> {
+    ///
+    /// `driver` is an explicit backend chosen on the command line (`-R`); when
+    /// given it is used verbatim with no fallback. When `None`, the
+    /// `VOXFONT_AUDIO_DRIVER` env override wins, otherwise the usual Linux
+    /// drivers are tried in order.
+    pub fn new(driver: Option<&str>) -> Result<(Synth, Option<String>), String> {
         silence_fluid_logging();
         unsafe {
             let settings = new_fluid_settings();
@@ -135,12 +140,17 @@ impl Synth {
                 return Err("new_fluid_synth failed".into());
             }
 
-            // Pick the audio driver. An explicit VOXFONT_AUDIO_DRIVER override
-            // wins; otherwise prefer JACK (a clean client name on PipeWire/JACK)
-            // and fall back to the usual Linux drivers if it isn't available.
-            let candidates: Vec<String> = match std::env::var("VOXFONT_AUDIO_DRIVER") {
-                Ok(drv) => vec![drv],
-                Err(_) => vec!["jack".into(), "pulseaudio".into(), "alsa".into()],
+            // Pick the audio driver. An explicit `-R` choice wins and is used
+            // verbatim (no fallback — the user asked for this backend). Failing
+            // that, a VOXFONT_AUDIO_DRIVER env override wins; otherwise prefer
+            // JACK (a clean client name on PipeWire/JACK) and fall back to the
+            // usual Linux drivers if it isn't available.
+            let candidates: Vec<String> = match driver {
+                Some(drv) => vec![drv.to_string()],
+                None => match std::env::var("VOXFONT_AUDIO_DRIVER") {
+                    Ok(drv) => vec![drv],
+                    Err(_) => vec!["jack".into(), "pulseaudio".into(), "alsa".into()],
+                },
             };
             let mut driver = std::ptr::null_mut();
             for cand in &candidates {

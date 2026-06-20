@@ -68,8 +68,8 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(midi_dir: Location, sf2_dir: Location) -> Result<App, String> {
-        let (mut synth, warn) = Synth::new()?;
+    pub fn new(midi_dir: Location, sf2_dir: Location, driver: Option<&str>) -> Result<App, String> {
+        let (mut synth, warn) = Synth::new(driver)?;
         let volume = 60u8;
         synth.set_gain(volume_to_gain(volume));
 

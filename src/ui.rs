@@ -259,12 +259,22 @@ fn draw_player(app: &App, frame: &mut Frame, area: Rect) {
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
 
-    let ratio = app.progress();
+    let (ratio, gauge_col) = gauge_appearance(app.state, app.progress(), state_col);
     let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(state_col).bg(Color::Black))
+        .gauge_style(Style::default().fg(gauge_col).bg(Color::Black))
         .ratio(ratio)
         .label(format!("{:.0}%", ratio * 100.0));
     frame.render_widget(gauge, rows[1]);
+}
+
+/// Ratio and colour for the playback progress bar. When stopped the bar is
+/// reset to empty (the player keeps reporting its last tick, so we don't trust
+/// `progress()` here) and shown in a neutral colour rather than recoloured red.
+fn gauge_appearance(state: PlayState, progress: f64, state_col: Color) -> (f64, Color) {
+    match state {
+        PlayState::Stopped => (0.0, Color::DarkGray),
+        _ => (progress, state_col),
+    }
 }
 
 fn draw_hints(app: &App, frame: &mut Frame, area: Rect) {
@@ -431,6 +441,25 @@ fn truncate_pad(s: &str, w: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_resets_gauge_instead_of_recolouring() {
+        // While playing/paused the bar keeps its progress and state colour.
+        assert_eq!(
+            gauge_appearance(PlayState::Playing, 0.42, Color::Green),
+            (0.42, Color::Green)
+        );
+        assert_eq!(
+            gauge_appearance(PlayState::Paused, 0.42, Color::Yellow),
+            (0.42, Color::Yellow)
+        );
+        // On stop the bar resets to empty and is not recoloured red, even though
+        // the synth still reports a near-full position.
+        assert_eq!(
+            gauge_appearance(PlayState::Stopped, 0.99, Color::Red),
+            (0.0, Color::DarkGray)
+        );
+    }
 
     #[test]
     fn fmt_time_minutes_and_hours() {

@@ -307,23 +307,45 @@ impl Browser {
         }
     }
 
-    /// The next/previous playable (non-dir) file relative to `loc`. Walks the
-    /// full listing, not the filtered view, so auto-advance is unaffected by a
-    /// transient search filter.
-    pub fn neighbour_file(&self, loc: &Location, forward: bool) -> Option<Location> {
-        let files: Vec<&Entry> = self.all.iter().filter(|e| !e.is_dir).collect();
-        let cur = files.iter().position(|e| &e.loc == loc)?;
+    /// The next/previous playable (non-dir) file relative to `loc`, resolved
+    /// within `loc`'s own container directory/archive — *not* wherever the
+    /// browser is currently pointed. This lets auto-advance keep playing
+    /// through the directory of the playing file even after the user has
+    /// browsed elsewhere. Returns `None` past the last/first file, or if the
+    /// container is gone.
+    pub fn neighbour_file(&mut self, loc: &Location, forward: bool) -> Option<Location> {
+        let files = self.list_files_in(&loc.parent()?);
+        let cur = files.iter().position(|l| l == loc)?;
         let next = if forward {
             cur + 1
         } else {
             cur.checked_sub(1)?
         };
-        files.get(next).map(|e| e.loc.clone())
+        files.get(next).cloned()
     }
 
-    /// The first playable (non-directory) file in this directory, if any.
-    pub fn first_file(&self) -> Option<Location> {
-        self.all.iter().find(|e| !e.is_dir).map(|e| e.loc.clone())
+    /// The first playable (non-directory) file in `loc`'s container, if any.
+    /// Used to loop back to the start of the playing file's directory.
+    pub fn first_file_of(&mut self, loc: &Location) -> Option<Location> {
+        self.list_files_in(&loc.parent()?).into_iter().next()
+    }
+
+    /// Sorted playable files in `dir`, honouring the hidden-file and extension
+    /// rules but ignoring any active search filter and the browser's own
+    /// cursor/current directory. Reads the container fresh, so it reflects the
+    /// real listing of the playing file's directory or archive.
+    fn list_files_in(&mut self, dir: &Location) -> Vec<Location> {
+        let mut files: Vec<(String, Location)> = Vec::new();
+        for c in vfs::read_dir(dir, &mut self.zip_cache, self.allow_archives) {
+            if !self.show_hidden && c.name.starts_with('.') {
+                continue;
+            }
+            if !c.is_dir && self.matches_ext(&c.name) {
+                files.push((c.name.to_lowercase(), c.loc));
+            }
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files.into_iter().map(|(_, loc)| loc).collect()
     }
 }
 
@@ -422,13 +444,41 @@ mod tests {
         for n in ["a.mid", "b.mid", "c.mid"] {
             fs::write(d.path().join(n), b"x").unwrap();
         }
-        let b = Browser::new_at(Location::Fs(d.path().to_path_buf()), &["mid"], false, false);
+        let mut b = Browser::new_at(Location::Fs(d.path().to_path_buf()), &["mid"], false, false);
         let loc = |n: &str| Location::Fs(d.path().join(n));
         let (a, bb, c) = (loc("a.mid"), loc("b.mid"), loc("c.mid"));
         assert_eq!(b.neighbour_file(&bb, true), Some(c.clone()));
         assert_eq!(b.neighbour_file(&bb, false), Some(a.clone()));
         assert_eq!(b.neighbour_file(&a, false), None);
         assert_eq!(b.neighbour_file(&c, true), None);
+    }
+
+    #[test]
+    fn neighbour_and_first_follow_the_playing_dir_not_the_browsed_one() {
+        // Two directories, each with its own files. Start the browser in `play`
+        // (where the "playing" file lives), then navigate it away into `other`.
+        // Auto-advance must still resolve within `play`.
+        let root = tempdir().unwrap();
+        let play = root.path().join("play");
+        let other = root.path().join("other");
+        fs::create_dir(&play).unwrap();
+        fs::create_dir(&other).unwrap();
+        for n in ["1.mid", "2.mid", "3.mid"] {
+            fs::write(play.join(n), b"x").unwrap();
+        }
+        fs::write(other.join("z.mid"), b"x").unwrap();
+
+        let mut b = Browser::new_at(Location::Fs(play.clone()), &["mid"], false, false);
+        // Browse away to the unrelated directory.
+        b.set_dir(other.clone());
+
+        let p = |n: &str| Location::Fs(play.join(n));
+        // Next/previous still walk the playing file's own directory.
+        assert_eq!(b.neighbour_file(&p("2.mid"), true), Some(p("3.mid")));
+        assert_eq!(b.neighbour_file(&p("2.mid"), false), Some(p("1.mid")));
+        // Past the end, repeat-mode wrap finds the first file of that dir.
+        assert_eq!(b.neighbour_file(&p("3.mid"), true), None);
+        assert_eq!(b.first_file_of(&p("3.mid")), Some(p("1.mid")));
     }
 
     #[test]

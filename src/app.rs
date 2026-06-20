@@ -369,8 +369,9 @@ impl App {
             if let Some(next) = self.midi.neighbour_file(&cur, true) {
                 self.play_path(next);
             } else if self.repeat {
-                // End of directory: loop back to the first file.
-                match self.midi.first_file() {
+                // End of directory: loop back to the first file of the playing
+                // file's directory (not wherever the user is now browsing).
+                match self.midi.first_file_of(&cur) {
                     Some(first) => self.play_path(first),
                     None => self.stop(),
                 }

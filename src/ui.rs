@@ -1,6 +1,6 @@
 //! ratatui rendering: two browser panels above a player bar.
 
-use crate::app::{App, Panel, PlayState};
+use crate::app::{App, Panel, PlayState, Source};
 use crate::history;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -31,8 +31,8 @@ pub fn draw(f: &mut App, frame: &mut Frame) {
     draw_player(f, frame, rows[1]);
     draw_hints(f, frame, rows[2]);
 
-    if f.hist.is_some() {
-        draw_history(f, frame, area);
+    if f.overlay.is_some() {
+        draw_overlay(f, frame, area);
     }
     if f.show_help {
         draw_help(frame, area);
@@ -109,7 +109,14 @@ fn draw_panel(app: &mut App, frame: &mut Frame, area: Rect, panel: Panel, title:
             } else {
                 base
             };
-            let marker = if playing { "♪ " } else { "  " };
+            // Two columns: what is playing, and the favourite star — solid when
+            // this exact pair is starred, hollow when the item is starred in
+            // some other pairing.
+            let marker = format!(
+                "{}{}",
+                if playing { "♪" } else { " " },
+                app.star_for(panel, &e.loc)
+            );
 
             // Right-hand column: archive/SoundFont size or MIDI duration.
             // Archives are shown as directories but carry a file size, rendered
@@ -246,6 +253,22 @@ fn draw_player(app: &App, frame: &mut Frame, area: Rect) {
     spans.push(Span::styled(" Next ", if app.next_mode { on } else { off }));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(" Rep ", if app.repeat { on } else { off }));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        " Fav ",
+        if app.current_is_favourite() { on } else { off },
+    ));
+    // While the favourites are the queue, show how far along it is.
+    if let Some((at, n)) = app.playlist_position() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(" Favs {at}/{n} "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     if let Some(msg) = &app.message {
         spans.push(Span::raw("   "));
@@ -301,22 +324,34 @@ fn draw_hints(app: &App, frame: &mut Frame, area: Rect) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    let hint = "Tab panels  Enter play/load  Space pause  s stop  ←/→ seek  n next-mode  r repeat  </> vol  i go  G playing  R history  / filter  h help  q quit";
+    let hint = "Tab panels  Enter play/load  Space pause  s stop  ←/→ seek  n next-mode  r repeat  </> vol  i go  G playing  R history  f star  F favs  / filter  h help  q quit";
     frame.render_widget(
         Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
         area,
     );
 }
 
-/// The playing-history overlay: what was played, through which SoundFont, when.
-/// Rows are newest first; `Tab` switches between the combination view and the
-/// per-track / per-SoundFont groupings of the same log.
-fn draw_history(app: &mut App, frame: &mut Frame, area: Rect) {
-    let (view, filter, filtering, count) = match &app.hist {
-        Some(h) => (h.view, h.filter.clone(), h.filtering, h.rows.len()),
+/// The overlay, showing either store as a table of (track, SoundFont) rows.
+///
+/// For the history that is what was played, through which font and when, newest
+/// first, with `Tab` switching between the combination view and the per-track /
+/// per-SoundFont groupings of the same log. For the favourites it is the starred
+/// pairs in playlist order, which `Shift`+`↑`/`↓` reorders.
+fn draw_overlay(app: &mut App, frame: &mut Frame, area: Rect) {
+    let (source, view, filter, filtering, count) = match &app.overlay {
+        Some(o) => (
+            o.source,
+            o.view,
+            o.filter.clone(),
+            o.filtering,
+            o.rows.len(),
+        ),
         None => return,
     };
-    let total = app.history.len();
+    let total = match source {
+        Source::History => app.history.len(),
+        Source::Favourites => app.favs.len(),
+    };
 
     let w = area.width.saturating_sub(4).min(110);
     // Tall enough for the rows it has (headings + list + detail + borders),
@@ -332,14 +367,23 @@ fn draw_history(app: &mut App, frame: &mut Frame, area: Rect) {
     };
     frame.render_widget(Clear, popup);
 
+    let heading = match source {
+        Source::History => format!("History — {}", view.title()),
+        Source::Favourites => "Favourites".to_string(),
+    };
     // While filtering the count reads "matches of total", as the panels do.
     let title = if filtering || !filter.is_empty() {
-        format!(
-            " History — {} · /{filter} · {count} of {total} ",
-            view.title()
-        )
+        format!(" {heading} · /{filter} · {count} of {total} ")
     } else {
-        format!(" History — {} · {count} ", view.title())
+        format!(" {heading} · {count} ")
+    };
+    let hint = match source {
+        Source::History => {
+            " Enter play · Tab view · f star · G reveal · d forget · D erase all · / filter · Esc close "
+        }
+        Source::Favourites => {
+            " Enter play from here · ⇧↑↓ move · d remove · G reveal · / filter · Esc close "
+        }
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -351,7 +395,7 @@ fn draw_history(app: &mut App, frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Line::from(Span::styled(
-            " Enter play · Tab view · G reveal · d forget · D erase all · / filter · Esc close ",
+            hint,
             Style::default().fg(Color::DarkGray),
         )));
     let inner = block.inner(popup);
@@ -367,37 +411,68 @@ fn draw_history(app: &mut App, frame: &mut Frame, area: Rect) {
         .split(inner);
 
     let cols = history_columns(inner.width);
+    let when_heading = match source {
+        Source::History => "when",
+        Source::Favourites => "starred",
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            history_row_text("when", "track", "soundfont", "plays", cols),
+            history_row_text(when_heading, "track", "soundfont", "plays", cols),
             Style::default().fg(Color::DarkGray),
         ))),
         rows[0],
     );
 
     let now = history::now_secs();
+    // Precomputed here rather than per row: the favourites overlay marks the
+    // row that is playing, the history overlay marks the rows that are starred.
+    let playing = (app.now_playing.clone(), app.soundfont.clone());
     let items: Vec<ListItem> = app
-        .hist
+        .overlay
         .as_ref()
-        .map(|hst| {
-            hst.rows
+        .map(|ov| {
+            ov.rows
                 .iter()
                 .map(|r| {
                     // A row whose file has since disappeared is dimmed and
                     // flagged, rather than silently failing when played.
                     let gone = r.gone;
-                    let style = if gone {
-                        Style::default().fg(Color::DarkGray)
-                    } else {
-                        Style::default().fg(Color::White)
+                    let is_playing = !gone && (r.midi.clone(), r.soundfont.clone()) == playing;
+                    let style = match (gone, is_playing) {
+                        (true, _) => Style::default().fg(Color::DarkGray),
+                        (false, true) => Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                        _ => Style::default().fg(Color::White),
                     };
-                    let mark = if gone { "!" } else { " " };
+                    // Two mark columns: gone, then the row's own state. Every
+                    // favourite is starred by definition, so there that slot
+                    // shows what is playing instead.
+                    let state = match (source, is_playing) {
+                        (Source::Favourites, playing) => {
+                            if playing {
+                                "♪"
+                            } else {
+                                " "
+                            }
+                        }
+                        (Source::History, _) => match (&r.midi, &r.soundfont) {
+                            (Some(m), Some(sf)) if app.favs.is_pair(m, sf) => "★",
+                            _ => " ",
+                        },
+                    };
+                    let mark = format!("{}{}", if gone { "!" } else { " " }, state);
+                    // A starred pair that has never been played has no count.
+                    let plays = match r.plays {
+                        0 => String::new(),
+                        n => format!("{n}x"),
+                    };
                     ListItem::new(Line::from(Span::styled(
                         history_row_text(
                             &format!("{}{}", mark, history::fmt_stamp(r.when, false)),
                             &name_of(&r.midi),
                             &name_of(&r.soundfont),
-                            &format!("{}x", r.plays),
+                            &plays,
                             cols,
                         ),
                         style,
@@ -413,13 +488,13 @@ fn draw_history(app: &mut App, frame: &mut Frame, area: Rect) {
             .fg(Color::Black)
             .add_modifier(Modifier::BOLD),
     );
-    if let Some(hst) = app.hist.as_mut() {
-        frame.render_stateful_widget(list, rows[1], &mut hst.state);
+    if let Some(ov) = app.overlay.as_mut() {
+        frame.render_stateful_widget(list, rows[1], &mut ov.state);
     }
 
     // Detail: the full locations of the selected row, which the columns above
     // can only show the names of.
-    let detail: Vec<Line> = match app.hist.as_ref().and_then(|h| h.selected()) {
+    let detail: Vec<Line> = match app.overlay.as_ref().and_then(|o| o.selected()) {
         Some(r) => {
             let age = history::fmt_age(now, r.when);
             vec![
@@ -428,16 +503,19 @@ fn draw_history(app: &mut App, frame: &mut Frame, area: Rect) {
             ]
         }
         None => vec![Line::from(Span::styled(
-            "  nothing played yet — press Enter on a MIDI file to start",
+            match source {
+                Source::History => "  nothing played yet — press Enter on a MIDI file to start",
+                Source::Favourites => "  nothing starred yet — press f while a track is playing",
+            },
             Style::default().fg(Color::DarkGray),
         ))],
     };
     frame.render_widget(Paragraph::new(detail), rows[2]);
 }
 
-/// Column widths of the history table: timestamp, track, soundfont, plays.
+/// Column widths of the overlay table: timestamp, track, soundfont, plays.
 fn history_columns(width: u16) -> (usize, usize, usize, usize) {
-    let stamp = 17; // "!YYYY-MM-DD HH:MM"
+    let stamp = 18; // "!★YYYY-MM-DD HH:MM"
     let plays = 5;
     let rest = (width as usize).saturating_sub(stamp + plays + 4); // 4 = gaps
     let track = rest / 2;
@@ -503,6 +581,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  i              go to directory (Tab completes)"),
         Line::from("  G              jump to playing track / loaded SoundFont"),
         Line::from("  R              playing history (Enter replays track + SoundFont)"),
+        Line::from("  f              star the track + SoundFont being heard"),
+        Line::from("  F              favourites — Enter plays the list from there"),
         Line::from("  Space / p      pause / resume"),
         Line::from("  s              stop"),
         Line::from("  ← →            seek 5s    [ ]  seek 30s"),
@@ -585,7 +665,7 @@ fn human_size(n: u64) -> String {
 /// right-aligned column (size/duration). Columns stay aligned because no
 /// highlight symbol shifts the rows.
 fn row_line<'a>(
-    marker: &'a str,
+    marker: String,
     icon: &str,
     name: &str,
     name_style: Style,
@@ -674,6 +754,54 @@ mod tests {
         assert!(out.contains(&history::fmt_stamp(when, false)), "{out}");
         // The detail lines spell out where each file actually lives.
         assert!(out.contains("/m/CANYON.MID"), "{out}");
+
+        // A cramped terminal must still render rather than panic on layout.
+        let _ = rendered(&mut app, 24, 6);
+    }
+
+    #[test]
+    fn favourites_show_a_star_in_the_panels_and_list_in_the_overlay() {
+        use crate::vfs::Location;
+
+        let midi_dir = tempfile::tempdir().unwrap();
+        let sf_dir = tempfile::tempdir().unwrap();
+        let track = midi_dir.path().join("CANYON.MID");
+        let font = sf_dir.path().join("CT8MGM.SF2");
+        std::fs::write(&track, b"x").unwrap();
+        std::fs::write(&font, b"x").unwrap();
+
+        let mut app = App::new(
+            Location::Fs(midi_dir.path().to_path_buf()),
+            Location::Fs(sf_dir.path().to_path_buf()),
+            None,
+        )
+        .expect("app init");
+        app.midi.refresh();
+        app.sf2.refresh();
+        app.now_playing = Some(Location::Fs(track.clone()));
+        app.soundfont = Some(Location::Fs(font.clone()));
+        app.favs
+            .toggle(Location::Fs(track), Location::Fs(font), 1_758_067_400);
+
+        // Both panels mark the starred pair solid — the track in one, the font
+        // it is starred with in the other.
+        let out = rendered(&mut app, 100, 24);
+        assert_eq!(out.matches('★').count(), 2, "one star per panel:\n{out}");
+        // And the player bar's Fav badge is there.
+        assert!(out.contains("Fav"), "{out}");
+
+        // The overlay lists the pair, under its own heading and hints.
+        app.favourites_open();
+        let out = rendered(&mut app, 100, 24);
+        assert!(out.contains("Favourites"), "{out}");
+        assert!(out.contains("CANYON.MID"), "{out}");
+        assert!(out.contains("CT8MGM.SF2"), "{out}");
+        assert!(out.contains("Enter play from here"), "{out}");
+        // A star on every row would be noise, so the overlay adds none — the
+        // two still on screen are the panels' own, behind the popup — and the
+        // slot marks the playing row instead, the third ♪ here.
+        assert_eq!(out.matches('★').count(), 2, "{out}");
+        assert_eq!(out.matches('♪').count(), 3, "{out}");
 
         // A cramped terminal must still render rather than panic on layout.
         let _ = rendered(&mut app, 24, 6);

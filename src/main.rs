@@ -1,5 +1,6 @@
 mod app;
 mod browser;
+mod favourites;
 mod fluid;
 mod history;
 mod midi;
@@ -7,7 +8,7 @@ mod state;
 mod ui;
 mod vfs;
 
-use app::App;
+use app::{App, Source};
 use ratatui::crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -196,6 +197,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !cli.no_history {
         app.history = history::History::load();
     }
+    // Favourites are always loaded: starring is a deliberate act, not a
+    // recording of what happened to play, so `--no-history` does not cover it.
+    app.favs = favourites::Favourites::load();
 
     // Seed the remembered file (before any load, which would re-save state) and
     // put the MIDI cursor on it if it is in the opened directory.
@@ -223,7 +227,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Persist the final directories and loaded SoundFont for next launch, plus
     // whatever was still playing when the user quit.
     app.save_state();
-    app.finish_history();
+    app.finish();
     res?;
     Ok(())
 }
@@ -329,9 +333,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // History overlay.
-    if app.hist.is_some() {
-        handle_history_key(app, key);
+    // History / favourites overlay.
+    if app.overlay.is_some() {
+        handle_overlay_key(app, key);
         return;
     }
 
@@ -367,8 +371,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('i') => app.start_goto(),
         // Jump to the currently playing MIDI / loaded SoundFont.
         KeyCode::Char('G') => app.goto_current(),
-        // Playing history.
+        // Playing history and favourites.
         KeyCode::Char('R') => app.history_open(),
+        KeyCode::Char('F') => app.favourites_open(),
+        KeyCode::Char('f') => app.toggle_favourite(),
 
         KeyCode::Char('p') | KeyCode::Char(' ') => app.toggle_pause(),
         KeyCode::Char('s') => app.stop(),
@@ -400,53 +406,74 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Keys while the history overlay is open. `Enter` replays the selected entry
-/// with its SoundFont; the overlay otherwise navigates like a panel.
-fn handle_history_key(app: &mut App, key: KeyEvent) {
+/// Keys while the history or favourites overlay is open. `Enter` plays the
+/// selected row with its SoundFont; the overlay otherwise navigates like a
+/// panel. `R` and `F` switch between the two stores, or close the one showing.
+fn handle_overlay_key(app: &mut App, key: KeyEvent) {
     // `/` filter mode captures printable keys; cursor keys still move.
-    if app.history_filtering() {
+    if app.overlay_filtering() {
         match key.code {
-            KeyCode::Esc => app.history_filter_cancel(),
-            KeyCode::Enter => app.history_restore(),
-            KeyCode::Backspace => app.history_filter_backspace(),
-            KeyCode::Char(c) => app.history_filter_push(c),
-            _ => history_move_key(app, key),
+            KeyCode::Esc => app.overlay_filter_cancel(),
+            KeyCode::Enter => app.overlay_activate(),
+            KeyCode::Backspace => app.overlay_filter_backspace(),
+            KeyCode::Char(c) => app.overlay_filter_push(c),
+            _ => overlay_move_key(app, key),
         }
         return;
     }
 
     // Any key other than a second `D` takes back the "erase everything" prompt.
     if key.code != KeyCode::Char('D') {
-        app.history_cancel_confirm();
+        app.overlay_cancel_confirm();
     }
 
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char('R') => {
-            app.history_close()
-        }
-        KeyCode::Enter => app.history_restore(),
-        KeyCode::Tab | KeyCode::BackTab => app.history_cycle_view(),
-        KeyCode::Char('G') => app.history_reveal(),
-        KeyCode::Char('d') => app.history_forget(),
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => app.overlay_close(),
+        KeyCode::Char('R') => match app.overlay_source() {
+            Some(Source::History) => app.overlay_close(),
+            _ => app.history_open(),
+        },
+        KeyCode::Char('F') => match app.overlay_source() {
+            Some(Source::Favourites) => app.overlay_close(),
+            _ => app.favourites_open(),
+        },
+        KeyCode::Enter => app.overlay_activate(),
+        KeyCode::Tab | KeyCode::BackTab => app.overlay_cycle_view(),
+        KeyCode::Char('G') => app.overlay_reveal(),
+        KeyCode::Char('d') => app.overlay_delete(),
+        KeyCode::Char('f') => app.overlay_toggle_favourite(),
         KeyCode::Char('D') => app.history_clear(),
-        KeyCode::Char('/') | KeyCode::Char('g') => app.history_start_filter(),
-        _ => history_move_key(app, key),
+        // Reorder the playlist. Shift+arrows are handled in the movement
+        // helper, so they work while the filter is capturing keys too; J/K are
+        // there for terminals that swallow shifted arrows.
+        KeyCode::Char('J') => app.overlay_move(true),
+        KeyCode::Char('K') => app.overlay_move(false),
+        KeyCode::Char('/') | KeyCode::Char('g') => app.overlay_start_filter(),
+        _ => overlay_move_key(app, key),
     }
 }
 
-/// Cursor movement inside the history overlay, shared by both its modes.
-fn history_move_key(app: &mut App, key: KeyEvent) {
-    let hist = match app.hist.as_mut() {
-        Some(h) => h,
+/// Cursor movement inside the overlay, shared by both its modes.
+fn overlay_move_key(app: &mut App, key: KeyEvent) {
+    // Shifted arrows move the selected favourite, not the cursor.
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::Up => return app.overlay_move(false),
+            KeyCode::Down => return app.overlay_move(true),
+            _ => {}
+        }
+    }
+    let overlay = match app.overlay.as_mut() {
+        Some(o) => o,
         None => return,
     };
     match key.code {
-        KeyCode::Up => hist.move_up(1),
-        KeyCode::Down => hist.move_down(1),
-        KeyCode::PageUp => hist.move_up(10),
-        KeyCode::PageDown => hist.move_down(10),
-        KeyCode::Home => hist.home(),
-        KeyCode::End => hist.end(),
+        KeyCode::Up => overlay.move_up(1),
+        KeyCode::Down => overlay.move_down(1),
+        KeyCode::PageUp => overlay.move_up(10),
+        KeyCode::PageDown => overlay.move_down(10),
+        KeyCode::Home => overlay.home(),
+        KeyCode::End => overlay.end(),
         _ => {}
     }
 }

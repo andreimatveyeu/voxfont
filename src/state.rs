@@ -7,7 +7,8 @@
 //! persisted too; see [`Location::encode`].
 
 use crate::vfs::Location;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 #[derive(Default)]
 pub struct State {
@@ -18,7 +19,24 @@ pub struct State {
     pub soundfont: Option<Location>,
 }
 
-/// The directory holding voxfont's session file and playing history.
+/// Write via a temporary file in the same directory plus a rename, so an
+/// interrupted write cannot truncate an accumulated file. Shared by the playing
+/// history and the favourites, both of which are appended to over months and
+/// must never be left half-written.
+pub fn write_atomically(path: &Path, body: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("conf.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// The directory holding voxfont's session file, playing history and favourites.
 pub fn config_dir() -> Option<PathBuf> {
     if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
         if !x.is_empty() {

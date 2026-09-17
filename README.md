@@ -38,6 +38,8 @@ plugins, no mouse.
 - **Lightweight** — launches instantly and drives FluidSynth directly.
 - **Remembers** — restores your directories and SoundFont next time, and keeps a
   history of what you played through what, replayable with one keypress.
+- **Favourites** — star a track-and-SoundFont pairing you like, and play the
+  starred list back as a playlist, each entry through its own SoundFont.
 
 ## Build
 
@@ -101,7 +103,7 @@ Press <kbd>R</kbd> for the history, newest at the top:
 │ 2026-09-16 17:13 —                        2MBGMGS.SF2                   2x │
 │ track  /home/me/midi/CANYON.MID   (2 min ago)                              │
 │ font   /srv/sf2/CT8MGM.SF2                                                 │
-└ Enter play · Tab view · G reveal · d forget · D erase all · / filter ──────┘
+└ Enter play · Tab view · f star · G reveal · d forget · / filter ───────────┘
 ```
 
 | Key | Action |
@@ -109,6 +111,7 @@ Press <kbd>R</kbd> for the history, newest at the top:
 | `Enter` | replay: load the font, play the track, move the panels onto it |
 | `Tab` | switch view: combinations · one row per track · one per SoundFont |
 | `G` | point both panels at the entry without playing it |
+| `f` | star the row as a favourite (marked `★` in the second column) |
 | `d` | forget the selected entry · `D` erase the whole history (asks twice) |
 | `/` | filter by track or SoundFont name |
 | `Esc` / `q` | close |
@@ -121,6 +124,70 @@ The history lives beside the session file, in
 `$XDG_CONFIG_HOME/voxfont/history.conf` (default `~/.config/voxfont/`), as plain
 text you can read, edit or delete. It is never sent anywhere. Start voxfont with
 `--no-history` to leave it untouched for a run.
+
+### Favourites and the playlist
+
+A favourite is a **pair**: this track through this SoundFont. That is the
+judgement worth keeping — the same tune can be wonderful through one font and
+flat through another — so there is no way to star a MIDI file or a SoundFont on
+its own. Star the same tune with three fonts and you get three favourites.
+
+Press <kbd>f</kbd> while a track is playing to star what you are hearing, and
+again to take the star off. It works on the track that just ended too, so you
+don't have to decide before the last note.
+
+The panels mark starred items in the column beside the `♪`:
+
+```
+┌ MIDI files — ~/midi ─────────────────┐┌ SoundFonts — ~/sf2 ──────────────────┐
+│♪★ CANYON.MID                    2:08 ││♪★ CT8MGM.SF2                    8.2M │
+│ ☆ popcorn.mid                   1:24 ││ ☆ RolandSC55.sf2                 32M │
+│    axelf.mid                    3:02 ││    2MBGMGS.SF2                  2.1M │
+└──────────────────────────────────────┘└──────────────────────────────────────┘
+```
+
+`★` means this exact pair is starred; `☆` means the item is starred in some
+*other* pairing. Swap the loaded SoundFont and the solid stars move, which shows
+at a glance which combinations you have already tried and which are new ground.
+
+Press <kbd>F</kbd> for the list, in playlist order:
+
+```
+┌ Favourites · 4 ────────────────────────────────────────────────────────────┐
+│starred           track                    soundfont                  plays │
+│♪2026-09-17 18:12 CANYON.MID               CT8MGM.SF2                    3x │
+│ 2026-09-17 18:14 bwv1041.mid              RolandSC55.sf2                1x │
+│ 2026-09-17 19:02 popcorn.mid              AweROMGM.sf2                     │
+│!2026-09-16 11:40 axelf.mid                FluidR3_GM.sf2                2x │
+│ track  /home/me/midi/CANYON.MID   (2 min ago)                              │
+│ font   /srv/sf2/CT8MGM.SF2                                                 │
+└ Enter play from here · ⇧↑↓ move · d remove · G reveal · / filter ──────────┘
+```
+
+| Key | Action |
+| --- | --- |
+| `Enter` | play the list from this entry on |
+| `Shift`+`↑` `↓` | move the entry up or down the playlist (`K` / `J` too) |
+| `G` | point both panels at the entry without playing it |
+| `d` or `f` | take the star off |
+| `/` | filter by track or SoundFont name |
+| `Esc` / `q` | close |
+
+`Enter` makes the favourites the queue: when a track ends, **next** mode moves
+to the next starred pair and loads *its* SoundFont, so a list can walk one tune
+through several fonts, or several tunes each through the font that suits it. The
+player bar shows how far along the list you are. Entries whose files have gone
+(`!`) are skipped rather than dropped — the drive may simply not be mounted.
+Pressing <kbd>Enter</kbd> on a file in the MIDI panel hands the queue back to
+the directory. The **next** and **repeat** modes behave exactly as they do for a
+directory; only the source of "next" differs.
+
+Play counts come from the history rather than being counted again, so a pair you
+have starred but never played shows none. The favourites live in
+`$XDG_CONFIG_HOME/voxfont/favourites.conf`, in the same readable format, and the
+file's order *is* the playlist order. `--no-history` does not touch them:
+starring is a deliberate act, not a recording of what happened to play. There is
+no "erase all" key — every favourite was starred by hand.
 
 Force a specific audio backend if the default doesn't produce sound:
 
@@ -150,6 +217,8 @@ voxfont --selftest /path/to/font.sf2 /path/to/song.mid
 | `<` `>` | volume −1 / +1 · `,` `.` volume −5 / +5 |
 | `Alt`+`1`…`9` | set volume 10%…90% |
 | `R` | playing history (`Enter` replays the track with its SoundFont) |
+| `f` | star the track + SoundFont being heard as a favourite |
+| `F` | favourites (`Enter` plays the starred list from there on) |
 | `H` | toggle hidden files · `Ctrl`+`r` reload panel |
 | `/` or `g` | incremental search in the active panel |
 | `h` / `?` | help · `q` / `Q` quit |
@@ -164,6 +233,9 @@ what happens when a track ends:
 | off | on | loop the current track |
 | on | off | play through the directory, then stop |
 | on | on | loop the whole directory |
+
+When playback was started from the favourites (<kbd>F</kbd> → <kbd>Enter</kbd>),
+"the directory" in that table becomes the starred list.
 
 ## License
 

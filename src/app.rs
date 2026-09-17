@@ -2,6 +2,7 @@
 //! to the fluidsynth player.
 
 use crate::browser::Browser;
+use crate::favourites::Favourites;
 use crate::fluid::Synth;
 use crate::history::{self, History, Row, View};
 use crate::midi::{self, MidiInfo};
@@ -46,11 +47,50 @@ struct Pending {
     count: bool,
 }
 
-/// State of the history overlay while it is open.
-pub struct HistoryUi {
+/// Which store the overlay is showing. Both are lists of (track, SoundFont)
+/// rows over the same layout and keys, so they share one overlay rather than
+/// each growing their own copy of the navigation, filter and reveal logic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Source {
+    History,
+    Favourites,
+}
+
+/// Where the *next* track comes from when the current one finishes. Set by
+/// whatever started playing: browsing plays on through the directory, a
+/// favourite plays on through the favourites list. There is deliberately no
+/// separate "playlist mode" to toggle — as with directory playback, where you
+/// started decides what follows.
+#[derive(Clone)]
+enum PlaySource {
+    Directory,
+    /// Playing the favourites list. `key` identifies the entry that is playing
+    /// so the position survives a reorder; `idx` is where it sat, used as a
+    /// fallback if that entry is un-starred while it plays.
+    Favourites {
+        key: (Location, Location),
+        idx: usize,
+    },
+}
+
+/// The next thing to play, as resolved from the current [`PlaySource`].
+struct Step {
+    midi: Location,
+    /// The SoundFont it must be heard through; `None` keeps the loaded one.
+    soundfont: Option<Location>,
+    /// Its index in the favourites list, when it came from there.
+    fav_idx: Option<usize>,
+}
+
+/// State of the history / favourites overlay while it is open.
+pub struct Overlay {
+    pub source: Source,
+    /// Which projection of the history is shown. Unused by the favourites,
+    /// which are one flat list: grouping them would hide the individual pairs
+    /// the list exists to hold, and leave reordering with no clear meaning.
     pub view: View,
     pub state: ListState,
-    /// The rows of `view` matching `filter`, as currently displayed.
+    /// The rows matching `filter`, as currently displayed.
     pub rows: Vec<Row>,
     pub filter: String,
     /// True while `/` is capturing keystrokes into `filter`.
@@ -59,7 +99,7 @@ pub struct HistoryUi {
     confirm_clear: bool,
 }
 
-impl HistoryUi {
+impl Overlay {
     pub fn selected(&self) -> Option<&Row> {
         self.state.selected().and_then(|i| self.rows.get(i))
     }
@@ -112,10 +152,16 @@ pub struct App {
     /// What has been played, and through which SoundFont. Starts in-memory
     /// only; `main` swaps in the persisted one unless `--no-history` was given.
     pub history: History,
+    /// The starred (track, SoundFont) pairs, which double as the playlist.
+    /// Starts in-memory only; `main` swaps in the persisted one. `--no-history`
+    /// does not affect it: a star is a deliberate act, not a recording.
+    pub favs: Favourites,
     /// The combination being listened to right now, not yet committed.
     pending: Option<Pending>,
-    /// Open history overlay, if any.
-    pub hist: Option<HistoryUi>,
+    /// Open history / favourites overlay, if any.
+    pub overlay: Option<Overlay>,
+    /// Where the next track comes from when this one ends.
+    play_source: PlaySource,
 
     /// Temp files backing the current track / SoundFont when they come from an
     /// archive. Kept alive while in use; dropping them deletes the temp file.
@@ -161,8 +207,10 @@ impl App {
             last_played: None,
             cur_info: None,
             history: History::default(),
+            favs: Favourites::default(),
             pending: None,
-            hist: None,
+            overlay: None,
+            play_source: PlaySource::Directory,
             play_temp: None,
             sf_temp: None,
             volume,
@@ -227,8 +275,14 @@ impl App {
             None => return,
         };
         match self.active {
+            // Loading a font by hand is the A/B move; it does not leave the
+            // favourites playlist, whose next entry brings its own font.
             Panel::Sf2 => self.load_soundfont(loc),
-            Panel::Midi => self.play_path(loc),
+            // Playing from the panel hands the queue back to the directory.
+            Panel::Midi => {
+                self.play_source = PlaySource::Directory;
+                self.play_path(loc);
+            }
         }
     }
 
@@ -471,8 +525,12 @@ impl App {
     /// |------|--------|----------------------------------------|
     /// | off  | off    | stop                                   |
     /// | off  | on     | replay current track (loop track)      |
-    /// | on   | off    | play next; stop after the last file    |
-    /// | on   | on     | play next; wrap to first (loop dir)    |
+    /// | on   | off    | play next; stop after the last         |
+    /// | on   | on     | play next; wrap to the first           |
+    ///
+    /// "Next" means the next file in the playing file's directory, or the next
+    /// starred pair when the favourites started this track — see
+    /// [`PlaySource`]. The table itself is the same either way.
     pub fn tick(&mut self) {
         // A combination becomes history as soon as it has been heard long
         // enough, rather than at the end of the track, so it survives a crash
@@ -496,23 +554,92 @@ impl App {
         };
 
         if self.next_mode {
-            if let Some(next) = self.midi.neighbour_file(&cur, true) {
-                self.play_path(next);
-            } else if self.repeat {
-                // End of directory: loop back to the first file of the playing
-                // file's directory (not wherever the user is now browsing).
-                match self.midi.first_file_of(&cur) {
-                    Some(first) => self.play_path(first),
-                    None => self.stop(),
-                }
-            } else {
-                self.stop();
+            match self.next_in_source(&cur) {
+                Some(step) => self.play_step(step),
+                None => self.stop(),
             }
         } else if self.repeat {
             self.play_track(cur, false); // loop the current track
         } else {
             self.stop();
         }
+    }
+
+    /// What follows `cur`, according to the current play source. `None` means
+    /// there is nothing left to play and the player should stop.
+    fn next_in_source(&mut self, cur: &Location) -> Option<Step> {
+        match self.play_source.clone() {
+            PlaySource::Directory => {
+                let next = match self.midi.neighbour_file(cur, true) {
+                    Some(n) => Some(n),
+                    // End of directory: loop back to the first file of the
+                    // playing file's directory (not wherever the user is now
+                    // browsing).
+                    None if self.repeat => self.midi.first_file_of(cur),
+                    None => None,
+                };
+                next.map(|midi| Step {
+                    midi,
+                    soundfont: None,
+                    fav_idx: None,
+                })
+            }
+            PlaySource::Favourites { key, idx } => self.next_favourite(&key, idx),
+        }
+    }
+
+    /// Walk forward through the favourites from the entry that just played,
+    /// skipping any whose track or SoundFont has gone. The scan is capped at
+    /// one pass over the list, so a playlist whose files have all disappeared
+    /// stops rather than spinning.
+    fn next_favourite(&self, key: &(Location, Location), idx: usize) -> Option<Step> {
+        let n = self.favs.len();
+        if n == 0 {
+            return None;
+        }
+        // The entry that just played may have been un-starred while it played.
+        // If it is gone, carry on with whatever moved into its slot instead of
+        // stepping over it; otherwise its current position is authoritative,
+        // so a reorder mid-playlist is followed rather than fought.
+        let (at, first) = match self.favs.position_of(&key.0, &key.1) {
+            Some(p) => (p, 1),
+            None => (idx, 0),
+        };
+        for offset in first..first + n {
+            let i = match at + offset {
+                i if i < n => i,
+                i if self.repeat => i % n,
+                _ => return None,
+            };
+            let fav = self.favs.get(i)?;
+            if fav.midi.exists() && fav.soundfont.exists() {
+                return Some(Step {
+                    midi: fav.midi.clone(),
+                    soundfont: Some(fav.soundfont.clone()),
+                    fav_idx: Some(i),
+                });
+            }
+        }
+        None
+    }
+
+    /// Play what [`Self::next_in_source`] resolved, loading the step's own
+    /// SoundFont first when it brought one.
+    fn play_step(&mut self, step: Step) {
+        if let (Some(sf), Some(i)) = (step.soundfont.clone(), step.fav_idx) {
+            // Advancing the queue is not a choice the user made, so the font is
+            // loaded without a history record: the play itself is recorded, and
+            // a font-only row (or one pairing the finished track with the new
+            // font) would be noise.
+            if self.soundfont.as_ref() != Some(&sf) {
+                self.load_font(sf.clone(), false);
+            }
+            self.play_source = PlaySource::Favourites {
+                key: (step.midi.clone(), sf),
+                idx: i,
+            };
+        }
+        self.play_track(step.midi, true);
     }
 
     /// Progress fraction 0.0..=1.0 from the player's tick counters.
@@ -593,27 +720,137 @@ impl App {
         }
     }
 
-    /// Commit whatever is still pending and flush the history — called on exit.
-    pub fn finish_history(&mut self) {
+    /// Commit whatever is still pending and flush both stores — called on exit.
+    /// The favourites save on every change, so this only catches a write that
+    /// failed earlier.
+    pub fn finish(&mut self) {
         self.commit_history();
         self.history.save();
+        self.favs.save();
     }
 
+    // --- favourites (the `f` key) ---------------------------------------------
+
+    /// Star, or un-star, the pair being heard: the loaded track through the
+    /// loaded SoundFont. A favourite is always a pair — the judgement worth
+    /// keeping is "this tune through this font" — so both are required. The
+    /// cursor is deliberately not consulted: in the ordinary flow it is on the
+    /// playing track anyway, and when it is not, what you are hearing is what
+    /// you mean. `stop()` leaves `now_playing` set, so this still works on the
+    /// track that just ended.
+    pub fn toggle_favourite(&mut self) {
+        let (midi, sf) = match (self.now_playing.clone(), self.soundfont.clone()) {
+            (Some(m), Some(s)) => (m, s),
+            _ => {
+                self.message =
+                    Some("Nothing playing — a favourite is a track + SoundFont pair".into());
+                return;
+            }
+        };
+        self.star(midi, sf);
+    }
+
+    /// Toggle the star on one pair and report it. A star is an explicit act, so
+    /// unlike the history it is stored at once, with no listening threshold.
+    fn star(&mut self, midi: Location, soundfont: Location) {
+        let name = midi.file_name();
+        let font = soundfont.file_name();
+        let added = self.favs.toggle(midi, soundfont, history::now_secs());
+        self.favs.save();
+        self.message = Some(if added {
+            format!("★ {name} + {font}")
+        } else {
+            format!("Unstarred: {name} + {font}")
+        });
+    }
+
+    /// The star to draw beside a browser entry: solid when this exact pair is
+    /// starred, hollow when the item is starred in some other pairing, blank
+    /// otherwise. The hollow star is what makes a pairs-only list readable
+    /// while browsing — swap the font and the solid stars move, showing at a
+    /// glance which combinations are already starred and which are new ground.
+    pub fn star_for(&self, panel: Panel, loc: &Location) -> &'static str {
+        let (exact, any) = match panel {
+            Panel::Midi => (
+                self.soundfont
+                    .as_ref()
+                    .map(|sf| self.favs.is_pair(loc, sf))
+                    .unwrap_or(false),
+                self.favs.has_track(loc),
+            ),
+            Panel::Sf2 => (
+                self.now_playing
+                    .as_ref()
+                    .map(|m| self.favs.is_pair(m, loc))
+                    .unwrap_or(false),
+                self.favs.has_font(loc),
+            ),
+        };
+        match (exact, any) {
+            (true, _) => "★",
+            (false, true) => "☆",
+            _ => " ",
+        }
+    }
+
+    /// True when the pair being heard is starred, for the player-bar badge.
+    pub fn current_is_favourite(&self) -> bool {
+        match (&self.now_playing, &self.soundfont) {
+            (Some(m), Some(sf)) => self.favs.is_pair(m, sf),
+            _ => false,
+        }
+    }
+
+    /// (position, length) in the favourites playlist, when it is what is
+    /// playing. `None` while the queue is the directory.
+    pub fn playlist_position(&self) -> Option<(usize, usize)> {
+        match &self.play_source {
+            PlaySource::Directory => None,
+            PlaySource::Favourites { key, idx } => {
+                // The list can be emptied, or shortened, while it is the queue.
+                let n = self.favs.len();
+                if n == 0 {
+                    return None;
+                }
+                let at = self
+                    .favs
+                    .position_of(&key.0, &key.1)
+                    .unwrap_or(*idx)
+                    .min(n - 1);
+                Some((at + 1, n))
+            }
+        }
+    }
+
+    // --- the history / favourites overlay (the `R` and `F` keys) --------------
+
     pub fn history_open(&mut self) {
+        self.overlay_open(Source::History);
+    }
+
+    pub fn favourites_open(&mut self) {
+        self.overlay_open(Source::Favourites);
+    }
+
+    fn overlay_open(&mut self, source: Source) {
         // The overlay and the panel filter are exclusive modes: leaving search
         // restores the full listing behind the overlay.
         if self.search.is_some() {
             self.search_cancel();
         }
         let view = View::Pairs;
-        let rows = self.history.rows(view, "");
+        let rows = self.overlay_rows(source, view, "");
         let mut state = ListState::default();
         state.select((!rows.is_empty()).then_some(0));
-        self.message = self
-            .history
-            .is_empty()
-            .then(|| "History is empty".to_string());
-        self.hist = Some(HistoryUi {
+        self.message = match source {
+            Source::History if self.history.is_empty() => Some("History is empty".to_string()),
+            Source::Favourites if self.favs.is_empty() => {
+                Some("No favourites yet — press f while a track is playing".to_string())
+            }
+            _ => None,
+        };
+        self.overlay = Some(Overlay {
+            source,
             view,
             state,
             rows,
@@ -623,127 +860,180 @@ impl App {
         });
     }
 
-    pub fn history_close(&mut self) {
-        self.hist = None;
+    fn overlay_rows(&self, source: Source, view: View, filter: &str) -> Vec<Row> {
+        match source {
+            Source::History => self.history.rows(view, filter),
+            Source::Favourites => self.favs.rows(filter, &self.history),
+        }
+    }
+
+    pub fn overlay_close(&mut self) {
+        self.overlay = None;
     }
 
     /// True while the overlay's `/` filter is capturing keystrokes.
-    pub fn history_filtering(&self) -> bool {
-        self.hist.as_ref().map(|h| h.filtering).unwrap_or(false)
+    pub fn overlay_filtering(&self) -> bool {
+        self.overlay.as_ref().map(|o| o.filtering).unwrap_or(false)
+    }
+
+    /// The store the open overlay is showing, if any.
+    pub fn overlay_source(&self) -> Option<Source> {
+        self.overlay.as_ref().map(|o| o.source)
     }
 
     /// Rebuild the visible rows after a view, filter or content change. The
     /// cursor is kept (clamped) when the rows still describe the same list.
-    fn history_rebuild(&mut self, keep_cursor: bool) {
-        let (view, filter, cur) = match &self.hist {
-            Some(h) => (h.view, h.filter.clone(), h.state.selected().unwrap_or(0)),
+    fn overlay_rebuild(&mut self, keep_cursor: bool) {
+        let (source, view, filter, cur) = match &self.overlay {
+            Some(o) => (
+                o.source,
+                o.view,
+                o.filter.clone(),
+                o.state.selected().unwrap_or(0),
+            ),
             None => return,
         };
-        let rows = self.history.rows(view, &filter);
-        if let Some(h) = self.hist.as_mut() {
+        let rows = self.overlay_rows(source, view, &filter);
+        if let Some(o) = self.overlay.as_mut() {
             let idx = match (rows.is_empty(), keep_cursor) {
                 (true, _) => None,
                 (false, true) => Some(cur.min(rows.len() - 1)),
                 (false, false) => Some(0),
             };
-            h.rows = rows;
-            h.state.select(idx);
+            o.rows = rows;
+            o.state.select(idx);
         }
     }
 
-    /// Cycle the overlay between the combination, per-track and per-SoundFont
-    /// views of the same log.
-    pub fn history_cycle_view(&mut self) {
-        if let Some(h) = self.hist.as_mut() {
-            h.view = h.view.next();
+    /// Cycle the history overlay between the combination, per-track and
+    /// per-SoundFont views of the same log. The favourites have no views.
+    pub fn overlay_cycle_view(&mut self) {
+        match self.overlay.as_mut() {
+            Some(o) if o.source == Source::History => o.view = o.view.next(),
+            _ => return,
         }
-        self.history_rebuild(false);
+        self.overlay_rebuild(false);
     }
 
-    pub fn history_start_filter(&mut self) {
-        if let Some(h) = self.hist.as_mut() {
-            h.filtering = true;
-            h.filter.clear();
+    pub fn overlay_start_filter(&mut self) {
+        if let Some(o) = self.overlay.as_mut() {
+            o.filtering = true;
+            o.filter.clear();
         }
-        self.history_rebuild(false);
+        self.overlay_rebuild(false);
     }
 
-    pub fn history_filter_push(&mut self, c: char) {
-        if let Some(h) = self.hist.as_mut() {
-            h.filter.push(c);
+    pub fn overlay_filter_push(&mut self, c: char) {
+        if let Some(o) = self.overlay.as_mut() {
+            o.filter.push(c);
         }
-        self.history_rebuild(false);
+        self.overlay_rebuild(false);
     }
 
-    pub fn history_filter_backspace(&mut self) {
-        if let Some(h) = self.hist.as_mut() {
-            h.filter.pop();
+    pub fn overlay_filter_backspace(&mut self) {
+        if let Some(o) = self.overlay.as_mut() {
+            o.filter.pop();
         }
-        self.history_rebuild(false);
+        self.overlay_rebuild(false);
     }
 
-    pub fn history_filter_cancel(&mut self) {
-        if let Some(h) = self.hist.as_mut() {
-            h.filtering = false;
-            h.filter.clear();
+    pub fn overlay_filter_cancel(&mut self) {
+        if let Some(o) = self.overlay.as_mut() {
+            o.filtering = false;
+            o.filter.clear();
         }
-        self.history_rebuild(false);
+        self.overlay_rebuild(false);
     }
 
-    /// Play the selected entry again exactly as it was heard: its SoundFont is
-    /// loaded first (unless it is already the loaded one), then its track. Both
-    /// are stored as locations, so an entry that lives inside a zip archive is
-    /// extracted and played just like it was the first time.
-    pub fn history_restore(&mut self) {
-        let row = match self.hist.as_ref().and_then(|h| h.selected()) {
-            Some(r) => r.clone(),
+    /// Play the selected row. From the history that means hearing the entry
+    /// again exactly as it was, and the queue reverts to the directory; from
+    /// the favourites it starts the playlist at that entry.
+    pub fn overlay_activate(&mut self) {
+        let (source, row) = match self.overlay.as_ref() {
+            Some(o) => match o.selected() {
+                Some(r) => (o.source, r.clone()),
+                None => return,
+            },
             None => return,
         };
-        self.hist = None;
-
-        // Check both sides first, so an entry that can no longer be played
-        // leaves the panels exactly as they were.
-        if let Some(sf) = &row.soundfont {
-            if !sf.exists() {
-                self.message = Some(format!("SoundFont is gone: {}", sf.display()));
-                return;
+        self.overlay = None;
+        match source {
+            Source::History => {
+                self.play_source = PlaySource::Directory;
+                self.play_combination(row.midi, row.soundfont);
+            }
+            Source::Favourites => {
+                if let Some(&idx) = row.idxs.first() {
+                    self.play_favourite_at(idx);
+                }
             }
         }
-        if let Some(midi) = &row.midi {
+    }
+
+    /// Start (or restart) the favourites playlist at `idx`.
+    fn play_favourite_at(&mut self, idx: usize) {
+        let fav = match self.favs.get(idx) {
+            Some(f) => f.clone(),
+            None => return,
+        };
+        if self.play_combination(Some(fav.midi.clone()), Some(fav.soundfont.clone())) {
+            self.play_source = PlaySource::Favourites {
+                key: (fav.midi, fav.soundfont),
+                idx,
+            };
+        }
+    }
+
+    /// Play a (track, SoundFont) combination the way the overlays do: its
+    /// SoundFont is loaded first (unless already loaded), then its track. Both
+    /// are locations, so a file inside a zip archive is extracted and played
+    /// just like it was the first time. Returns false when a side has gone,
+    /// having left the panels and the player untouched.
+    fn play_combination(&mut self, midi: Option<Location>, soundfont: Option<Location>) -> bool {
+        // Check both sides first, so an entry that can no longer be played
+        // leaves the panels exactly as they were.
+        if let Some(sf) = &soundfont {
+            if !sf.exists() {
+                self.message = Some(format!("SoundFont is gone: {}", sf.display()));
+                return false;
+            }
+        }
+        if let Some(midi) = &midi {
             if !midi.exists() {
                 self.message = Some(format!("File is gone: {}", midi.display()));
-                return;
+                return false;
             }
         }
 
         // Follow the entry in the panels before playing it, so the cursor ends
         // up on the file itself — inside the archive when that is where it
         // lives, not parked on the `.zip`.
-        if let Some(midi) = &row.midi {
+        if let Some(midi) = &midi {
             self.midi.reveal(midi);
         }
-        if let Some(sf) = &row.soundfont {
+        if let Some(sf) = &soundfont {
             self.sf2.reveal(sf);
         }
 
-        if let Some(sf) = row.soundfont {
+        if let Some(sf) = soundfont {
             if self.soundfont.as_ref() != Some(&sf) {
                 self.load_soundfont(sf);
             }
         }
-        if let Some(midi) = row.midi {
-            self.play_path(midi);
+        if let Some(midi) = midi {
+            self.play_track(midi, true);
         }
+        true
     }
 
-    /// Point both panels at the selected entry without playing it, the way `G`
+    /// Point both panels at the selected row without playing it, the way `G`
     /// does for what is currently playing.
-    pub fn history_reveal(&mut self) {
-        let row = match self.hist.as_ref().and_then(|h| h.selected()) {
+    pub fn overlay_reveal(&mut self) {
+        let row = match self.overlay.as_ref().and_then(|o| o.selected()) {
             Some(r) => r.clone(),
             None => return,
         };
-        self.hist = None;
+        self.overlay = None;
         if let Some(m) = &row.midi {
             self.midi.reveal(m);
         }
@@ -752,41 +1042,120 @@ impl App {
         }
     }
 
-    /// Forget the selected row: in a grouped view that is every entry behind it.
-    pub fn history_forget(&mut self) {
-        let idxs = match self.hist.as_ref().and_then(|h| h.selected()) {
-            Some(r) => r.idxs.clone(),
+    /// Drop the selected row: forget it from the history (in a grouped view,
+    /// every entry behind it), or take the star off a favourite.
+    pub fn overlay_delete(&mut self) {
+        let (source, idxs) = match self.overlay.as_ref() {
+            Some(o) => match o.selected() {
+                Some(r) => (o.source, r.idxs.clone()),
+                None => return,
+            },
             None => return,
         };
-        self.history.forget(&idxs);
-        self.history.save();
-        self.history_rebuild(true);
+        match source {
+            Source::History => {
+                self.history.forget(&idxs);
+                self.history.save();
+            }
+            Source::Favourites => {
+                if let Some(&i) = idxs.first() {
+                    self.favs.remove(i);
+                    self.favs.save();
+                }
+            }
+        }
+        self.overlay_rebuild(true);
+    }
+
+    /// `f` inside an overlay: star the selected history row, or un-star the
+    /// selected favourite (where it is the same gesture as `d`).
+    pub fn overlay_toggle_favourite(&mut self) {
+        let (source, row) = match self.overlay.as_ref() {
+            Some(o) => match o.selected() {
+                Some(r) => (o.source, r.clone()),
+                None => return,
+            },
+            None => return,
+        };
+        if source == Source::Favourites {
+            self.overlay_delete();
+            return;
+        }
+        match (row.midi, row.soundfont) {
+            (Some(m), Some(sf)) => {
+                self.star(m, sf);
+                self.overlay_rebuild(true);
+            }
+            // A SoundFont loaded with nothing playing is half a pair.
+            _ => {
+                self.message =
+                    Some("Not a pair — a favourite needs both a track and a SoundFont".into())
+            }
+        }
+    }
+
+    /// Move the selected favourite one place along the playlist, the cursor
+    /// following it. Under a filter the row swaps with its visible neighbour,
+    /// so the move is always the one on screen.
+    pub fn overlay_move(&mut self, down: bool) {
+        let (i, rows) = match self.overlay.as_ref() {
+            Some(o) if o.source == Source::Favourites => {
+                (o.state.selected().unwrap_or(0), o.rows.clone())
+            }
+            _ => return,
+        };
+        let j = match down {
+            true => i + 1,
+            false => match i.checked_sub(1) {
+                Some(j) => j,
+                None => return,
+            },
+        };
+        let (a, b) = match (rows.get(i), rows.get(j)) {
+            (Some(a), Some(b)) => (a.idxs[0], b.idxs[0]),
+            _ => return,
+        };
+        self.favs.swap(a, b);
+        self.favs.save();
+        self.overlay_rebuild(true);
+        if let Some(o) = self.overlay.as_mut() {
+            o.state.select(Some(j.min(o.rows.len().saturating_sub(1))));
+        }
     }
 
     /// Clear the whole history. The first press only asks; the second one does
-    /// it, since there is no undo.
+    /// it, since there is no undo. The favourites have no such key: every one
+    /// of them was starred by hand, so erasing the lot has no honest use.
     pub fn history_clear(&mut self) {
-        if !self.hist.as_ref().map(|h| h.confirm_clear).unwrap_or(false) {
-            if let Some(h) = self.hist.as_mut() {
-                h.confirm_clear = true;
+        if self.overlay_source() != Some(Source::History) {
+            return;
+        }
+        if !self
+            .overlay
+            .as_ref()
+            .map(|o| o.confirm_clear)
+            .unwrap_or(false)
+        {
+            if let Some(o) = self.overlay.as_mut() {
+                o.confirm_clear = true;
             }
             self.message = Some("Press D again to erase the whole history".into());
             return;
         }
         self.history.clear();
         self.history.save();
-        if let Some(h) = self.hist.as_mut() {
-            h.confirm_clear = false;
+        if let Some(o) = self.overlay.as_mut() {
+            o.confirm_clear = false;
         }
-        self.history_rebuild(false);
+        self.overlay_rebuild(false);
         self.message = Some("History erased".into());
     }
 
     /// Any other keypress takes back the pending "erase everything" question.
-    pub fn history_cancel_confirm(&mut self) {
-        if let Some(h) = self.hist.as_mut() {
-            if h.confirm_clear {
-                h.confirm_clear = false;
+    pub fn overlay_cancel_confirm(&mut self) {
+        if let Some(o) = self.overlay.as_mut() {
+            if o.confirm_clear {
+                o.confirm_clear = false;
                 self.message = None;
             }
         }
@@ -1033,36 +1402,36 @@ mod tests {
             .record(loc("/m/b.mid"), loc("/s/one.sf2"), 200, true);
 
         app.history_open();
-        let hist = app.hist.as_ref().expect("overlay open");
+        let hist = app.overlay.as_ref().expect("overlay open");
         assert_eq!(hist.rows.len(), 2);
         assert_eq!(hist.view, View::Pairs);
         // Newest first, cursor on the top row.
         assert_eq!(hist.selected().unwrap().midi, loc("/m/b.mid"));
 
         // Tab walks the three views of the same log.
-        app.history_cycle_view();
-        assert_eq!(app.hist.as_ref().unwrap().view, View::Tracks);
-        assert_eq!(app.hist.as_ref().unwrap().rows.len(), 2);
-        app.history_cycle_view();
-        assert_eq!(app.hist.as_ref().unwrap().view, View::Fonts);
+        app.overlay_cycle_view();
+        assert_eq!(app.overlay.as_ref().unwrap().view, View::Tracks);
+        assert_eq!(app.overlay.as_ref().unwrap().rows.len(), 2);
+        app.overlay_cycle_view();
+        assert_eq!(app.overlay.as_ref().unwrap().view, View::Fonts);
         assert_eq!(
-            app.hist.as_ref().unwrap().rows.len(),
+            app.overlay.as_ref().unwrap().rows.len(),
             1,
             "both plays used the same SoundFont"
         );
-        app.history_cycle_view();
+        app.overlay_cycle_view();
 
         // `/` narrows the list; Esc restores it.
-        app.history_start_filter();
-        app.history_filter_push('a');
-        assert_eq!(app.hist.as_ref().unwrap().rows.len(), 1);
-        app.history_filter_cancel();
-        assert_eq!(app.hist.as_ref().unwrap().rows.len(), 2);
+        app.overlay_start_filter();
+        app.overlay_filter_push('a');
+        assert_eq!(app.overlay.as_ref().unwrap().rows.len(), 1);
+        app.overlay_filter_cancel();
+        assert_eq!(app.overlay.as_ref().unwrap().rows.len(), 2);
 
         // `d` forgets the selected row and keeps the overlay usable.
-        app.history_forget();
+        app.overlay_delete();
         assert_eq!(app.history.len(), 1);
-        assert_eq!(app.hist.as_ref().unwrap().rows.len(), 1);
+        assert_eq!(app.overlay.as_ref().unwrap().rows.len(), 1);
 
         // `D` asks once, then erases.
         app.history_clear();
@@ -1070,8 +1439,8 @@ mod tests {
         app.history_clear();
         assert!(app.history.is_empty());
 
-        app.history_close();
-        assert!(app.hist.is_none());
+        app.overlay_close();
+        assert!(app.overlay.is_none());
     }
 
     #[test]
@@ -1080,9 +1449,9 @@ mod tests {
         app.history
             .record(loc("/no/such/track.mid"), None, 100, true);
         app.history_open();
-        app.history_restore();
+        app.overlay_activate();
 
-        assert!(app.hist.is_none(), "the overlay closes on activation");
+        assert!(app.overlay.is_none(), "the overlay closes on activation");
         assert!(app.message.unwrap().contains("gone"));
         assert!(app.now_playing.is_none());
     }
@@ -1120,7 +1489,7 @@ mod tests {
             true,
         );
         app.history_open();
-        app.history_restore();
+        app.overlay_activate();
 
         // The MIDI panel is inside the archive, on the track itself — not left
         // sitting on the .zip — and the SoundFont panel is on its font.
@@ -1145,7 +1514,7 @@ mod tests {
             true,
         );
         app.history_open();
-        app.history_restore();
+        app.overlay_activate();
         assert_eq!(
             app.midi.location(),
             Location::Fs(midi_dir.path().to_path_buf())
@@ -1173,9 +1542,9 @@ mod tests {
             true,
         );
         app.history_open();
-        app.history_reveal();
+        app.overlay_reveal();
 
-        assert!(app.hist.is_none());
+        assert!(app.overlay.is_none());
         assert_eq!(
             app.midi.selected().map(|e| e.loc.clone()),
             Some(Location::Fs(track))
@@ -1240,5 +1609,276 @@ mod tests {
             ..info
         };
         assert_eq!(bar_beat_at(100, &smpte), None);
+    }
+
+    /// An app with `n` tracks (a.mid, b.mid, …) and one SoundFont on disk, each
+    /// track starred against that font in name order.
+    fn playlist_app(n: usize) -> (App, tempfile::TempDir, tempfile::TempDir, Location) {
+        let (mut app, midi_dir, sf_dir) = test_app();
+        let font_path = sf_dir.path().join("piano.sf2");
+        std::fs::write(&font_path, b"x").unwrap();
+        let font = Location::Fs(font_path);
+        for i in 0..n {
+            let name = format!("{}.mid", (b'a' + i as u8) as char);
+            let path = midi_dir.path().join(&name);
+            std::fs::write(&path, b"x").unwrap();
+            app.favs
+                .toggle(Location::Fs(path), font.clone(), 100 + i as u64);
+        }
+        app.midi.refresh();
+        app.sf2.refresh();
+        (app, midi_dir, sf_dir, font)
+    }
+
+    /// The (track, font) key of the favourite at `idx`.
+    fn key_at(app: &App, idx: usize) -> (Location, Location) {
+        let f = app.favs.get(idx).expect("a favourite");
+        (f.midi.clone(), f.soundfont.clone())
+    }
+
+    #[test]
+    fn starring_needs_both_a_track_and_a_soundfont() {
+        let (mut app, _m, _s) = test_app();
+        app.toggle_favourite();
+        assert!(app.favs.is_empty());
+        assert!(app.message.as_ref().unwrap().contains("Nothing playing"));
+
+        app.now_playing = loc("/m/a.mid");
+        app.soundfont = loc("/s/one.sf2");
+        app.toggle_favourite();
+        assert_eq!(app.favs.len(), 1);
+        assert!(app.current_is_favourite());
+        assert!(app.message.as_ref().unwrap().starts_with('★'));
+
+        // The same keypress takes the star back off.
+        app.toggle_favourite();
+        assert!(app.favs.is_empty());
+        assert!(!app.current_is_favourite());
+    }
+
+    #[test]
+    fn the_star_marks_the_exact_pair_solid_and_other_pairings_hollow() {
+        let (mut app, _m, _s) = test_app();
+        let a = loc("/m/a.mid").unwrap();
+        let one = loc("/s/one.sf2").unwrap();
+        let two = loc("/s/two.sf2").unwrap();
+        app.favs.toggle(a.clone(), one.clone(), 100);
+
+        // MIDI panel: solid only while the pair's own font is the loaded one.
+        app.soundfont = Some(one.clone());
+        assert_eq!(app.star_for(Panel::Midi, &a), "★");
+        app.soundfont = Some(two.clone());
+        assert_eq!(app.star_for(Panel::Midi, &a), "☆");
+        assert_eq!(app.star_for(Panel::Midi, &loc("/m/b.mid").unwrap()), " ");
+
+        // SoundFont panel: solid only against the track that is playing.
+        app.now_playing = Some(a);
+        assert_eq!(app.star_for(Panel::Sf2, &one), "★");
+        app.now_playing = loc("/m/b.mid");
+        assert_eq!(app.star_for(Panel::Sf2, &one), "☆");
+        assert_eq!(app.star_for(Panel::Sf2, &two), " ");
+    }
+
+    #[test]
+    fn favourites_overlay_lists_reorders_and_unstars() {
+        let (mut app, _m, _s, _f) = playlist_app(3);
+        app.favourites_open();
+        let ov = app.overlay.as_ref().expect("overlay open");
+        assert_eq!(ov.source, Source::Favourites);
+        assert_eq!(ov.rows.len(), 3);
+        // Playlist order, cursor on the first entry.
+        assert_eq!(ov.selected().unwrap().midi, Some(key_at(&app, 0).0));
+
+        // Tab regroups the history, but the favourites stay one flat list.
+        app.overlay_cycle_view();
+        assert_eq!(app.overlay.as_ref().unwrap().rows.len(), 3);
+        assert_eq!(app.overlay.as_ref().unwrap().view, View::Pairs);
+
+        // Shift+Down moves the row, and the cursor follows it.
+        app.overlay_move(true);
+        assert_eq!(app.favs.get(1).unwrap().midi.file_name(), "a.mid");
+        let ov = app.overlay.as_ref().unwrap();
+        assert_eq!(ov.state.selected(), Some(1));
+        assert_eq!(
+            ov.selected().unwrap().midi.as_ref().unwrap().file_name(),
+            "a.mid"
+        );
+
+        // Back up, then past the top: moving off the end is a no-op.
+        app.overlay_move(false);
+        app.overlay_move(false);
+        assert_eq!(app.favs.get(0).unwrap().midi.file_name(), "a.mid");
+        assert_eq!(app.overlay.as_ref().unwrap().state.selected(), Some(0));
+
+        // `d` unstars the selected row, and `f` is the same gesture here.
+        app.overlay_delete();
+        assert_eq!(app.favs.len(), 2);
+        assert_eq!(app.overlay.as_ref().unwrap().rows.len(), 2);
+        app.overlay_toggle_favourite();
+        assert_eq!(app.favs.len(), 1);
+
+        // There is no erase-all for favourites, so `D` does nothing.
+        app.history_clear();
+        assert_eq!(app.favs.len(), 1);
+        assert!(app.message.is_none());
+    }
+
+    #[test]
+    fn f_in_the_history_overlay_stars_a_row_but_not_half_a_pair() {
+        let (mut app, _m, _s) = test_app();
+        app.history
+            .record(loc("/m/a.mid"), loc("/s/one.sf2"), 100, true);
+        // A SoundFont loaded with nothing playing.
+        app.history.record(None, loc("/s/two.sf2"), 200, true);
+        app.history_open();
+
+        // The newest row is the font on its own: not a pair, so not starrable.
+        app.overlay_toggle_favourite();
+        assert!(app.favs.is_empty());
+        assert!(app.message.as_ref().unwrap().contains("Not a pair"));
+
+        // The pair below it stars, and un-stars on a second press.
+        app.overlay.as_mut().unwrap().move_down(1);
+        app.overlay_toggle_favourite();
+        assert!(app
+            .favs
+            .is_pair(&loc("/m/a.mid").unwrap(), &loc("/s/one.sf2").unwrap()));
+        app.overlay_toggle_favourite();
+        assert!(app.favs.is_empty());
+        // Starring a history row leaves the history itself alone.
+        assert_eq!(app.history.len(), 2);
+    }
+
+    #[test]
+    fn the_playlist_advances_in_order_and_stops_at_the_end() {
+        let (mut app, _m, _s, font) = playlist_app(3);
+
+        let step = app.next_favourite(&key_at(&app, 0), 0).expect("b.mid");
+        assert_eq!(step.midi.file_name(), "b.mid");
+        assert_eq!(step.soundfont, Some(font), "each entry brings its own font");
+        assert_eq!(step.fav_idx, Some(1));
+
+        // Past the last entry the playlist stops rather than wrapping.
+        assert!(app.next_favourite(&key_at(&app, 2), 2).is_none());
+
+        // With repeat on it wraps to the first.
+        app.repeat = true;
+        let step = app.next_favourite(&key_at(&app, 2), 2).expect("wraps");
+        assert_eq!(step.midi.file_name(), "a.mid");
+        assert_eq!(step.fav_idx, Some(0));
+    }
+
+    #[test]
+    fn the_playlist_skips_entries_whose_files_have_gone() {
+        let (app, midi_dir, _s, _f) = playlist_app(3);
+        // b.mid disappears from under the playlist.
+        std::fs::remove_file(midi_dir.path().join("b.mid")).unwrap();
+        let step = app.next_favourite(&key_at(&app, 0), 0).expect("c.mid");
+        assert_eq!(step.midi.file_name(), "c.mid");
+        assert_eq!(step.fav_idx, Some(2));
+    }
+
+    #[test]
+    fn a_playlist_with_nothing_playable_terminates() {
+        let (mut app, midi_dir, _s, _f) = playlist_app(2);
+        // Repeat on, so a naive scan would wrap around for ever.
+        app.repeat = true;
+        for name in ["a.mid", "b.mid"] {
+            std::fs::remove_file(midi_dir.path().join(name)).unwrap();
+        }
+        assert!(app.next_favourite(&key_at(&app, 0), 0).is_none());
+    }
+
+    #[test]
+    fn unstarring_the_playing_entry_continues_with_the_one_that_took_its_slot() {
+        let (mut app, _m, _s, _f) = playlist_app(3);
+        let key = key_at(&app, 0);
+        // The entry that is playing is un-starred; b.mid now holds slot 0.
+        app.favs.remove(0);
+        let step = app
+            .next_favourite(&key, 0)
+            .expect("the entry that moved up");
+        assert_eq!(step.midi.file_name(), "b.mid");
+        assert_eq!(step.fav_idx, Some(0));
+    }
+
+    #[test]
+    fn a_reorder_while_playing_is_followed() {
+        let (mut app, _m, _s, _f) = playlist_app(3);
+        let key = key_at(&app, 0);
+        // a.mid is moved to the end while it plays, so what follows it is what
+        // follows its new position — not what followed the old one.
+        app.favs.swap(0, 2); // c, b, a
+        app.repeat = true;
+        let step = app.next_favourite(&key, 0).expect("wraps from the end");
+        assert_eq!(step.midi.file_name(), "c.mid");
+        assert_eq!(step.fav_idx, Some(0));
+    }
+
+    #[test]
+    fn the_directory_queue_is_unchanged_by_the_favourites() {
+        let (mut app, midi_dir, _s, _f) = playlist_app(3);
+        // Nothing started the playlist, so the queue is still the directory:
+        // the next file on disk, with no SoundFont of its own.
+        let a = Location::Fs(midi_dir.path().join("a.mid"));
+        let step = app.next_in_source(&a).expect("b.mid follows a.mid");
+        assert_eq!(step.midi.file_name(), "b.mid");
+        assert_eq!(step.soundfont, None, "the loaded font is kept");
+        assert_eq!(step.fav_idx, None);
+        assert!(app.playlist_position().is_none());
+    }
+
+    #[test]
+    fn playing_a_favourite_makes_it_the_queue_and_enter_hands_it_back() {
+        let (mut app, midi_dir, _s, _f) = playlist_app(2);
+        app.overlay_open(Source::Favourites);
+        app.overlay_activate();
+        assert!(app.overlay.is_none(), "the overlay closes on activation");
+        assert_eq!(app.playlist_position(), Some((1, 2)));
+
+        // Advancing the queue moves the position along with it.
+        let step = app.next_favourite(&key_at(&app, 0), 0).expect("b.mid");
+        app.play_step(step);
+        assert_eq!(app.playlist_position(), Some((2, 2)));
+        // The queue's own font load is not a choice the user made, so it adds
+        // no history row. (The synth cannot load a stub file under test, so
+        // this only guards the load path, not the play.)
+        assert!(app.history.is_empty());
+
+        // Playing from the panel hands the queue back to the directory.
+        app.midi
+            .select_loc(&Location::Fs(midi_dir.path().join("a.mid")));
+        app.active = Panel::Midi;
+        app.activate_selection();
+        assert!(app.playlist_position().is_none());
+    }
+
+    #[test]
+    fn emptying_the_list_while_it_is_the_queue_hides_the_badge() {
+        let (mut app, _m, _s, _f) = playlist_app(2);
+        app.play_favourite_at(1);
+        assert_eq!(app.playlist_position(), Some((2, 2)));
+
+        // Un-starring everything mid-playlist must not report a position in a
+        // list that no longer has one.
+        app.favs.remove(1);
+        assert_eq!(app.playlist_position(), Some((1, 1)), "clamped to the list");
+        app.favs.remove(0);
+        assert!(app.playlist_position().is_none());
+    }
+
+    #[test]
+    fn a_favourite_whose_file_vanished_reports_instead_of_playing() {
+        let (mut app, midi_dir, _s, _f) = playlist_app(1);
+        std::fs::remove_file(midi_dir.path().join("a.mid")).unwrap();
+        app.overlay_open(Source::Favourites);
+        app.overlay_activate();
+
+        assert!(app.message.as_ref().unwrap().contains("gone"));
+        assert!(app.now_playing.is_none());
+        // The failed start did not make the favourites the queue.
+        assert!(app.playlist_position().is_none());
+        // The favourite is kept: the drive may simply be unmounted.
+        assert_eq!(app.favs.len(), 1);
     }
 }

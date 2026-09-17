@@ -20,8 +20,7 @@
 
 use crate::vfs::Location;
 use std::collections::HashMap;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One remembered (track, SoundFont) combination.
@@ -133,7 +132,7 @@ impl History {
             Some(p) => p.clone(),
             None => return,
         };
-        if write_atomically(&path, &serialize(&self.entries)).is_ok() {
+        if crate::state::write_atomically(&path, &serialize(&self.entries)).is_ok() {
             self.dirty = false;
         }
     }
@@ -209,6 +208,17 @@ impl History {
         self.entries.is_empty()
     }
 
+    /// How many times this exact combination has been played, or 0 if it has
+    /// never been. The favourites overlay shows this rather than keeping a
+    /// count of its own, so the two can never disagree.
+    pub fn plays_of(&self, midi: &Location, soundfont: &Location) -> u32 {
+        self.entries
+            .iter()
+            .find(|e| e.midi.as_ref() == Some(midi) && e.soundfont.as_ref() == Some(soundfont))
+            .map(|e| e.plays)
+            .unwrap_or(0)
+    }
+
     /// Build the rows of `view`, keeping only those matching the
     /// case-insensitive `filter` (matched against what the row displays).
     pub fn rows(&self, view: View, filter: &str) -> Vec<Row> {
@@ -274,13 +284,13 @@ impl History {
 
 /// True when either side of a row has disappeared from disk, and playing it
 /// again would fail.
-fn is_gone(midi: &Option<Location>, soundfont: &Option<Location>) -> bool {
+pub(crate) fn is_gone(midi: &Option<Location>, soundfont: &Option<Location>) -> bool {
     let missing = |l: &Option<Location>| l.as_ref().map(|l| !l.exists()).unwrap_or(false);
     missing(midi) || missing(soundfont)
 }
 
 /// The text a filter is matched against: the two names the row displays.
-fn row_haystack(r: &Row) -> String {
+pub(crate) fn row_haystack(r: &Row) -> String {
     let name = |l: &Option<Location>| l.as_ref().map(|l| l.file_name()).unwrap_or_default();
     format!("{} {}", name(&r.midi), name(&r.soundfont)).to_lowercase()
 }
@@ -291,21 +301,6 @@ fn config_dir() -> Option<PathBuf> {
 
 fn history_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("history.conf"))
-}
-
-/// Write via a temporary file in the same directory plus a rename, so an
-/// interrupted write cannot truncate an accumulated history.
-fn write_atomically(path: &Path, body: &str) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("conf.tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(body.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
 }
 
 /// Parse the stanza file body. Unknown keys and malformed records are skipped

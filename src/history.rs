@@ -115,7 +115,7 @@ impl History {
             .map(|t| parse(&t))
             .unwrap_or_default();
         // Newest first, whatever order the file happened to be in.
-        entries.sort_by(|a, b| b.when.cmp(&a.when));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.when));
         History {
             entries,
             path: Some(path),
@@ -178,7 +178,7 @@ impl History {
         // sorting keeps the newest-first invariant true anyway — after a clock
         // change, or when an entry is re-recorded with an older timestamp. The
         // sort is stable, so equal timestamps keep the newest at the front.
-        self.entries.sort_by(|a, b| b.when.cmp(&a.when));
+        self.entries.sort_by_key(|e| std::cmp::Reverse(e.when));
         self.dirty = true;
     }
 

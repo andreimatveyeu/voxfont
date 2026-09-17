@@ -33,7 +33,7 @@ use tempfile::NamedTempFile;
 use zip::ZipArchive;
 
 /// Where a browsable item lives.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Location {
     /// A path on the real filesystem.
     Fs(PathBuf),
@@ -133,6 +133,30 @@ impl Location {
         match self {
             Location::Fs(p) => p.exists(),
             Location::Zip { archive, .. } => archive.is_file(),
+        }
+    }
+
+    /// True when `other` lives inside this location. A filesystem directory
+    /// contains everything below it — including the members of an archive
+    /// stored there — and an archive directory contains its own members. Used
+    /// to decide whether the cursor may descend to a remembered file.
+    pub fn contains(&self, other: &Location) -> bool {
+        match (self, other) {
+            (Location::Fs(dir), Location::Fs(p)) => p.starts_with(dir),
+            // The members of a zip kept under `dir` are under `dir` too.
+            (Location::Fs(dir), Location::Zip { archive, .. }) => archive.starts_with(dir),
+            (
+                Location::Zip {
+                    archive: a,
+                    inner: at,
+                },
+                Location::Zip {
+                    archive: b,
+                    inner: bt,
+                },
+            ) => a == b && (at.is_empty() || bt == at || bt.starts_with(&format!("{at}/"))),
+            // A zip never contains something outside itself.
+            (Location::Zip { .. }, Location::Fs(_)) => false,
         }
     }
 
@@ -564,6 +588,47 @@ mod tests {
             Location::decode("/old/style/path"),
             Location::Fs(PathBuf::from("/old/style/path"))
         );
+    }
+
+    #[test]
+    fn contains_spans_directories_and_archives() {
+        let dir = Location::Fs(PathBuf::from("/m"));
+        let member = Location::Zip {
+            archive: PathBuf::from("/m/songs.zip"),
+            inner: "a/x.mid".to_string(),
+        };
+
+        // A directory holds its own files, and the members of a zip inside it.
+        assert!(dir.contains(&Location::Fs(PathBuf::from("/m/sub/b.mid"))));
+        assert!(dir.contains(&member));
+        assert!(!dir.contains(&Location::Fs(PathBuf::from("/other/b.mid"))));
+        assert!(!dir.contains(&Location::Zip {
+            archive: PathBuf::from("/other/songs.zip"),
+            inner: "x.mid".to_string(),
+        }));
+
+        // Inside an archive: the root holds everything, a subdir only its own.
+        let root = Location::Zip {
+            archive: PathBuf::from("/m/songs.zip"),
+            inner: String::new(),
+        };
+        let sub = Location::Zip {
+            archive: PathBuf::from("/m/songs.zip"),
+            inner: "a".to_string(),
+        };
+        assert!(root.contains(&member));
+        assert!(sub.contains(&member));
+        assert!(!sub.contains(&Location::Zip {
+            archive: PathBuf::from("/m/songs.zip"),
+            inner: "b/y.mid".to_string(),
+        }));
+        // "ab/y.mid" is not inside "a", despite the shared prefix.
+        assert!(!sub.contains(&Location::Zip {
+            archive: PathBuf::from("/m/songs.zip"),
+            inner: "ab/y.mid".to_string(),
+        }));
+        // An archive contains nothing on the filesystem.
+        assert!(!root.contains(&Location::Fs(PathBuf::from("/m/b.mid"))));
     }
 
     #[test]

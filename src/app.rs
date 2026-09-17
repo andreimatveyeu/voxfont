@@ -3,8 +3,10 @@
 
 use crate::browser::Browser;
 use crate::fluid::Synth;
+use crate::history::{self, History, Row, View};
 use crate::midi::{self, MidiInfo};
 use crate::vfs::{self, Location};
+use ratatui::widgets::ListState;
 use rustyline::completion::{longest_common_prefix, Candidate, FilenameCompleter};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -12,6 +14,11 @@ use tempfile::NamedTempFile;
 
 pub const MIDI_EXTS: &[&str] = &["mid", "midi", "kar", "rmi"];
 pub const SF2_EXTS: &[&str] = &["sf2", "sf3"];
+
+/// How long a (track, SoundFont) combination must actually play before it is
+/// written to the history. Paging through a directory with Enter fires a play
+/// per keystroke; without this the history would fill with tracks nobody heard.
+const MIN_LISTEN_SECS: f64 = 5.0;
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum Panel {
@@ -24,6 +31,66 @@ pub enum PlayState {
     Stopped,
     Playing,
     Paused,
+}
+
+/// The combination currently being listened to, waiting to clear
+/// [`MIN_LISTEN_SECS`] before it is written to the history.
+struct Pending {
+    midi: Option<Location>,
+    soundfont: Option<Location>,
+    /// Value of the playback clock when this combination started, so the dwell
+    /// is measured in playback time (pauses don't count) rather than wall time.
+    at_secs: f64,
+    /// False for a repeat-mode loop of the track already at the top of the
+    /// history: it refreshes the timestamp without inflating the play count.
+    count: bool,
+}
+
+/// State of the history overlay while it is open.
+pub struct HistoryUi {
+    pub view: View,
+    pub state: ListState,
+    /// The rows of `view` matching `filter`, as currently displayed.
+    pub rows: Vec<Row>,
+    pub filter: String,
+    /// True while `/` is capturing keystrokes into `filter`.
+    pub filtering: bool,
+    /// Set by the first `D`; the second one actually clears the history.
+    confirm_clear: bool,
+}
+
+impl HistoryUi {
+    pub fn selected(&self) -> Option<&Row> {
+        self.state.selected().and_then(|i| self.rows.get(i))
+    }
+
+    pub fn move_down(&mut self, n: usize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let i = (self.state.selected().unwrap_or(0) + n).min(self.rows.len() - 1);
+        self.state.select(Some(i));
+    }
+
+    pub fn move_up(&mut self, n: usize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let cur = self.state.selected().unwrap_or(0);
+        self.state.select(Some(cur.saturating_sub(n)));
+    }
+
+    pub fn home(&mut self) {
+        if !self.rows.is_empty() {
+            self.state.select(Some(0));
+        }
+    }
+
+    pub fn end(&mut self) {
+        if !self.rows.is_empty() {
+            self.state.select(Some(self.rows.len() - 1));
+        }
+    }
 }
 
 pub struct App {
@@ -41,6 +108,14 @@ pub struct App {
     pub last_played: Option<Location>,
     /// Parsed metadata (division, time signature, duration) of the current track.
     pub cur_info: Option<MidiInfo>,
+
+    /// What has been played, and through which SoundFont. Starts in-memory
+    /// only; `main` swaps in the persisted one unless `--no-history` was given.
+    pub history: History,
+    /// The combination being listened to right now, not yet committed.
+    pending: Option<Pending>,
+    /// Open history overlay, if any.
+    pub hist: Option<HistoryUi>,
 
     /// Temp files backing the current track / SoundFont when they come from an
     /// archive. Kept alive while in use; dropping them deletes the temp file.
@@ -85,6 +160,9 @@ impl App {
             soundfont: None,
             last_played: None,
             cur_info: None,
+            history: History::default(),
+            pending: None,
+            hist: None,
             play_temp: None,
             sf_temp: None,
             volume,
@@ -192,6 +270,18 @@ impl App {
     }
 
     pub fn load_soundfont(&mut self, loc: Location) {
+        self.load_font(loc, true);
+    }
+
+    /// Load the SoundFont remembered from the last session without writing a
+    /// history entry: the user did not pick it this time, and an automatic
+    /// restore must not push it to the top of the history on every launch.
+    pub fn restore_soundfont(&mut self, loc: Location) {
+        self.load_font(loc, false);
+    }
+
+    /// Load `loc` into the synth, remembering the combination when `remember`.
+    fn load_font(&mut self, loc: Location, remember: bool) {
         // Archive members are extracted to a temp file first, since the FFI
         // loads SoundFonts by filename only.
         let (path, guard) = match vfs::resolve_to_file(&loc) {
@@ -204,6 +294,27 @@ impl App {
         match self.synth.load_soundfont(&path) {
             Ok(()) => {
                 let name = loc.file_name();
+                // Swapping the font under a playing track is the A/B move worth
+                // remembering as a combination; it starts a fresh dwell. With
+                // nothing playing there is no listening time to wait for, so the
+                // font is remembered on its own straight away.
+                self.commit_history();
+                if !remember {
+                    // Nothing to remember, but the combination changed: drop any
+                    // pending entry so it is not credited to the new font.
+                    self.pending = None;
+                } else if self.state != PlayState::Stopped && self.now_playing.is_some() {
+                    self.pending = Some(Pending {
+                        midi: self.now_playing.clone(),
+                        soundfont: Some(loc.clone()),
+                        at_secs: self.elapsed_secs(),
+                        count: true,
+                    });
+                } else {
+                    self.history
+                        .record(None, Some(loc.clone()), history::now_secs(), true);
+                    self.history.save();
+                }
                 self.soundfont = Some(loc);
                 self.sf_temp = guard;
                 self.message = Some(format!("SoundFont loaded: {name}"));
@@ -226,6 +337,13 @@ impl App {
     }
 
     pub fn play_path(&mut self, loc: Location) {
+        self.play_track(loc, true);
+    }
+
+    /// Play `loc` and start remembering it. `count_play` is false when repeat
+    /// mode is looping the same track again: the history entry's time is
+    /// refreshed, but one long loop is still one listening session.
+    fn play_track(&mut self, loc: Location, count_play: bool) {
         if !self.synth.has_soundfont() {
             self.message =
                 Some("No SoundFont loaded — pick one in the right panel (Tab, then Enter)".into());
@@ -243,14 +361,23 @@ impl App {
         };
         match self.synth.play(&path) {
             Ok(()) => {
+                // Commit what was playing while the playback clock still belongs
+                // to it, then restart the clock for this track.
+                self.commit_history();
                 self.message = None;
                 self.cur_info = midi::parse(&path);
                 self.now_playing = Some(loc.clone());
-                self.last_played = Some(loc);
+                self.last_played = Some(loc.clone());
                 self.play_temp = guard;
                 self.state = PlayState::Playing;
                 self.play_started = Some(Instant::now());
                 self.accumulated_secs = 0.0;
+                self.pending = Some(Pending {
+                    midi: Some(loc),
+                    soundfont: self.soundfont.clone(),
+                    at_secs: 0.0,
+                    count: count_play,
+                });
             }
             Err(e) => self.message = Some(e),
         }
@@ -277,6 +404,8 @@ impl App {
         if self.state == PlayState::Stopped {
             return;
         }
+        self.commit_history();
+        self.pending = None;
         self.synth.stop();
         self.state = PlayState::Stopped;
         self.play_started = None;
@@ -345,6 +474,10 @@ impl App {
     /// | on   | off    | play next; stop after the last file    |
     /// | on   | on     | play next; wrap to first (loop dir)    |
     pub fn tick(&mut self) {
+        // A combination becomes history as soon as it has been heard long
+        // enough, rather than at the end of the track, so it survives a crash
+        // and shows up in the overlay while it is still playing.
+        self.commit_history();
         if self.state != PlayState::Playing {
             return;
         }
@@ -376,7 +509,7 @@ impl App {
                 self.stop();
             }
         } else if self.repeat {
-            self.play_path(cur); // loop the current track
+            self.play_track(cur, false); // loop the current track
         } else {
             self.stop();
         }
@@ -436,6 +569,226 @@ impl App {
     fn accumulate(&mut self) {
         if let Some(t) = self.play_started {
             self.accumulated_secs += t.elapsed().as_secs_f64();
+        }
+    }
+
+    // --- playing history (the `R` key) ----------------------------------------
+
+    /// Write the pending combination to the history once it has actually been
+    /// heard for [`MIN_LISTEN_SECS`] of playback. Called at every transition and
+    /// on each UI tick; a combination that never reached the threshold is simply
+    /// dropped when the next one starts.
+    fn commit_history(&mut self) {
+        let due = match &self.pending {
+            Some(p) => self.elapsed_secs() - p.at_secs >= MIN_LISTEN_SECS,
+            None => false,
+        };
+        if !due {
+            return;
+        }
+        if let Some(p) = self.pending.take() {
+            self.history
+                .record(p.midi, p.soundfont, history::now_secs(), p.count);
+            self.history.save();
+        }
+    }
+
+    /// Commit whatever is still pending and flush the history — called on exit.
+    pub fn finish_history(&mut self) {
+        self.commit_history();
+        self.history.save();
+    }
+
+    pub fn history_open(&mut self) {
+        // The overlay and the panel filter are exclusive modes: leaving search
+        // restores the full listing behind the overlay.
+        if self.search.is_some() {
+            self.search_cancel();
+        }
+        let view = View::Pairs;
+        let rows = self.history.rows(view, "");
+        let mut state = ListState::default();
+        state.select((!rows.is_empty()).then_some(0));
+        self.message = self
+            .history
+            .is_empty()
+            .then(|| "History is empty".to_string());
+        self.hist = Some(HistoryUi {
+            view,
+            state,
+            rows,
+            filter: String::new(),
+            filtering: false,
+            confirm_clear: false,
+        });
+    }
+
+    pub fn history_close(&mut self) {
+        self.hist = None;
+    }
+
+    /// True while the overlay's `/` filter is capturing keystrokes.
+    pub fn history_filtering(&self) -> bool {
+        self.hist.as_ref().map(|h| h.filtering).unwrap_or(false)
+    }
+
+    /// Rebuild the visible rows after a view, filter or content change. The
+    /// cursor is kept (clamped) when the rows still describe the same list.
+    fn history_rebuild(&mut self, keep_cursor: bool) {
+        let (view, filter, cur) = match &self.hist {
+            Some(h) => (h.view, h.filter.clone(), h.state.selected().unwrap_or(0)),
+            None => return,
+        };
+        let rows = self.history.rows(view, &filter);
+        if let Some(h) = self.hist.as_mut() {
+            let idx = match (rows.is_empty(), keep_cursor) {
+                (true, _) => None,
+                (false, true) => Some(cur.min(rows.len() - 1)),
+                (false, false) => Some(0),
+            };
+            h.rows = rows;
+            h.state.select(idx);
+        }
+    }
+
+    /// Cycle the overlay between the combination, per-track and per-SoundFont
+    /// views of the same log.
+    pub fn history_cycle_view(&mut self) {
+        if let Some(h) = self.hist.as_mut() {
+            h.view = h.view.next();
+        }
+        self.history_rebuild(false);
+    }
+
+    pub fn history_start_filter(&mut self) {
+        if let Some(h) = self.hist.as_mut() {
+            h.filtering = true;
+            h.filter.clear();
+        }
+        self.history_rebuild(false);
+    }
+
+    pub fn history_filter_push(&mut self, c: char) {
+        if let Some(h) = self.hist.as_mut() {
+            h.filter.push(c);
+        }
+        self.history_rebuild(false);
+    }
+
+    pub fn history_filter_backspace(&mut self) {
+        if let Some(h) = self.hist.as_mut() {
+            h.filter.pop();
+        }
+        self.history_rebuild(false);
+    }
+
+    pub fn history_filter_cancel(&mut self) {
+        if let Some(h) = self.hist.as_mut() {
+            h.filtering = false;
+            h.filter.clear();
+        }
+        self.history_rebuild(false);
+    }
+
+    /// Play the selected entry again exactly as it was heard: its SoundFont is
+    /// loaded first (unless it is already the loaded one), then its track. Both
+    /// are stored as locations, so an entry that lives inside a zip archive is
+    /// extracted and played just like it was the first time.
+    pub fn history_restore(&mut self) {
+        let row = match self.hist.as_ref().and_then(|h| h.selected()) {
+            Some(r) => r.clone(),
+            None => return,
+        };
+        self.hist = None;
+
+        // Check both sides first, so an entry that can no longer be played
+        // leaves the panels exactly as they were.
+        if let Some(sf) = &row.soundfont {
+            if !sf.exists() {
+                self.message = Some(format!("SoundFont is gone: {}", sf.display()));
+                return;
+            }
+        }
+        if let Some(midi) = &row.midi {
+            if !midi.exists() {
+                self.message = Some(format!("File is gone: {}", midi.display()));
+                return;
+            }
+        }
+
+        // Follow the entry in the panels before playing it, so the cursor ends
+        // up on the file itself — inside the archive when that is where it
+        // lives, not parked on the `.zip`.
+        if let Some(midi) = &row.midi {
+            self.midi.reveal(midi);
+        }
+        if let Some(sf) = &row.soundfont {
+            self.sf2.reveal(sf);
+        }
+
+        if let Some(sf) = row.soundfont {
+            if self.soundfont.as_ref() != Some(&sf) {
+                self.load_soundfont(sf);
+            }
+        }
+        if let Some(midi) = row.midi {
+            self.play_path(midi);
+        }
+    }
+
+    /// Point both panels at the selected entry without playing it, the way `G`
+    /// does for what is currently playing.
+    pub fn history_reveal(&mut self) {
+        let row = match self.hist.as_ref().and_then(|h| h.selected()) {
+            Some(r) => r.clone(),
+            None => return,
+        };
+        self.hist = None;
+        if let Some(m) = &row.midi {
+            self.midi.reveal(m);
+        }
+        if let Some(sf) = &row.soundfont {
+            self.sf2.reveal(sf);
+        }
+    }
+
+    /// Forget the selected row: in a grouped view that is every entry behind it.
+    pub fn history_forget(&mut self) {
+        let idxs = match self.hist.as_ref().and_then(|h| h.selected()) {
+            Some(r) => r.idxs.clone(),
+            None => return,
+        };
+        self.history.forget(&idxs);
+        self.history.save();
+        self.history_rebuild(true);
+    }
+
+    /// Clear the whole history. The first press only asks; the second one does
+    /// it, since there is no undo.
+    pub fn history_clear(&mut self) {
+        if !self.hist.as_ref().map(|h| h.confirm_clear).unwrap_or(false) {
+            if let Some(h) = self.hist.as_mut() {
+                h.confirm_clear = true;
+            }
+            self.message = Some("Press D again to erase the whole history".into());
+            return;
+        }
+        self.history.clear();
+        self.history.save();
+        if let Some(h) = self.hist.as_mut() {
+            h.confirm_clear = false;
+        }
+        self.history_rebuild(false);
+        self.message = Some("History erased".into());
+    }
+
+    /// Any other keypress takes back the pending "erase everything" question.
+    pub fn history_cancel_confirm(&mut self) {
+        if let Some(h) = self.hist.as_mut() {
+            if h.confirm_clear {
+                h.confirm_clear = false;
+                self.message = None;
+            }
         }
     }
 
@@ -629,6 +982,208 @@ mod tests {
         assert_eq!(bar_beat_at(480, &info), Some((1, 2)));
         assert_eq!(bar_beat_at(1920, &info), Some((2, 1)));
         assert_eq!(bar_beat_at(1920 + 960, &info), Some((2, 3)));
+    }
+
+    /// An app rooted at two fresh temp directories, with an in-memory history.
+    fn test_app() -> (App, tempfile::TempDir, tempfile::TempDir) {
+        let midi_dir = tempfile::tempdir().unwrap();
+        let sf_dir = tempfile::tempdir().unwrap();
+        let app = App::new(
+            Location::Fs(midi_dir.path().to_path_buf()),
+            Location::Fs(sf_dir.path().to_path_buf()),
+            None,
+        )
+        .expect("app init");
+        (app, midi_dir, sf_dir)
+    }
+
+    fn loc(p: &str) -> Option<Location> {
+        Some(Location::Fs(PathBuf::from(p)))
+    }
+
+    #[test]
+    fn history_waits_until_a_track_has_actually_been_heard() {
+        let (mut app, _m, _s) = test_app();
+        app.pending = Some(Pending {
+            midi: loc("/m/a.mid"),
+            soundfont: loc("/s/one.sf2"),
+            at_secs: 0.0,
+            count: true,
+        });
+
+        // Skipped through after a couple of seconds: not worth remembering.
+        app.accumulated_secs = 2.0;
+        app.commit_history();
+        assert!(app.history.is_empty());
+
+        // Listened to past the threshold: remembered, and only once.
+        app.accumulated_secs = MIN_LISTEN_SECS + 0.5;
+        app.commit_history();
+        app.commit_history();
+        assert_eq!(app.history.len(), 1);
+        assert!(app.pending.is_none());
+    }
+
+    #[test]
+    fn history_overlay_lists_filters_and_forgets() {
+        let (mut app, _m, _s) = test_app();
+        app.history
+            .record(loc("/m/a.mid"), loc("/s/one.sf2"), 100, true);
+        app.history
+            .record(loc("/m/b.mid"), loc("/s/one.sf2"), 200, true);
+
+        app.history_open();
+        let hist = app.hist.as_ref().expect("overlay open");
+        assert_eq!(hist.rows.len(), 2);
+        assert_eq!(hist.view, View::Pairs);
+        // Newest first, cursor on the top row.
+        assert_eq!(hist.selected().unwrap().midi, loc("/m/b.mid"));
+
+        // Tab walks the three views of the same log.
+        app.history_cycle_view();
+        assert_eq!(app.hist.as_ref().unwrap().view, View::Tracks);
+        assert_eq!(app.hist.as_ref().unwrap().rows.len(), 2);
+        app.history_cycle_view();
+        assert_eq!(app.hist.as_ref().unwrap().view, View::Fonts);
+        assert_eq!(
+            app.hist.as_ref().unwrap().rows.len(),
+            1,
+            "both plays used the same SoundFont"
+        );
+        app.history_cycle_view();
+
+        // `/` narrows the list; Esc restores it.
+        app.history_start_filter();
+        app.history_filter_push('a');
+        assert_eq!(app.hist.as_ref().unwrap().rows.len(), 1);
+        app.history_filter_cancel();
+        assert_eq!(app.hist.as_ref().unwrap().rows.len(), 2);
+
+        // `d` forgets the selected row and keeps the overlay usable.
+        app.history_forget();
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.hist.as_ref().unwrap().rows.len(), 1);
+
+        // `D` asks once, then erases.
+        app.history_clear();
+        assert_eq!(app.history.len(), 1, "the first D only asks");
+        app.history_clear();
+        assert!(app.history.is_empty());
+
+        app.history_close();
+        assert!(app.hist.is_none());
+    }
+
+    #[test]
+    fn restoring_a_vanished_file_reports_instead_of_playing() {
+        let (mut app, _m, _s) = test_app();
+        app.history
+            .record(loc("/no/such/track.mid"), None, 100, true);
+        app.history_open();
+        app.history_restore();
+
+        assert!(app.hist.is_none(), "the overlay closes on activation");
+        assert!(app.message.unwrap().contains("gone"));
+        assert!(app.now_playing.is_none());
+    }
+
+    #[test]
+    fn restoring_an_entry_moves_the_panels_onto_it() {
+        use std::io::Write as _;
+
+        let (mut app, midi_dir, sf_dir) = test_app();
+        // A zip holding the track, plus a loose one beside it.
+        let zip_path = midi_dir.path().join("songs.zip");
+        {
+            let f = std::fs::File::create(&zip_path).unwrap();
+            let mut w = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            w.start_file("classics/canyon.mid", opts).unwrap();
+            w.write_all(b"data").unwrap();
+            w.finish().unwrap();
+        }
+        let loose = midi_dir.path().join("plain.mid");
+        let font = sf_dir.path().join("piano.sf2");
+        std::fs::write(&loose, b"x").unwrap();
+        std::fs::write(&font, b"x").unwrap();
+        app.midi.refresh();
+        app.sf2.refresh();
+
+        let member = Location::Zip {
+            archive: zip_path.clone(),
+            inner: "classics/canyon.mid".to_string(),
+        };
+        app.history.record(
+            Some(member.clone()),
+            Some(Location::Fs(font.clone())),
+            100,
+            true,
+        );
+        app.history_open();
+        app.history_restore();
+
+        // The MIDI panel is inside the archive, on the track itself — not left
+        // sitting on the .zip — and the SoundFont panel is on its font.
+        assert_eq!(
+            app.midi.location(),
+            Location::Zip {
+                archive: zip_path,
+                inner: "classics".to_string()
+            }
+        );
+        assert_eq!(app.midi.selected().map(|e| e.loc.clone()), Some(member));
+        assert_eq!(
+            app.sf2.selected().map(|e| e.loc.clone()),
+            Some(Location::Fs(font.clone()))
+        );
+
+        // A plain file moves the cursor the same way.
+        app.history.record(
+            Some(Location::Fs(loose.clone())),
+            Some(Location::Fs(font)),
+            200,
+            true,
+        );
+        app.history_open();
+        app.history_restore();
+        assert_eq!(
+            app.midi.location(),
+            Location::Fs(midi_dir.path().to_path_buf())
+        );
+        assert_eq!(
+            app.midi.selected().map(|e| e.loc.clone()),
+            Some(Location::Fs(loose))
+        );
+    }
+
+    #[test]
+    fn history_reveal_points_both_panels_at_the_entry() {
+        let (mut app, midi_dir, sf_dir) = test_app();
+        let track = midi_dir.path().join("song.mid");
+        let font = sf_dir.path().join("piano.sf2");
+        std::fs::write(&track, b"x").unwrap();
+        std::fs::write(&font, b"x").unwrap();
+        app.midi.refresh();
+        app.sf2.refresh();
+
+        app.history.record(
+            Some(Location::Fs(track.clone())),
+            Some(Location::Fs(font.clone())),
+            100,
+            true,
+        );
+        app.history_open();
+        app.history_reveal();
+
+        assert!(app.hist.is_none());
+        assert_eq!(
+            app.midi.selected().map(|e| e.loc.clone()),
+            Some(Location::Fs(track))
+        );
+        assert_eq!(
+            app.sf2.selected().map(|e| e.loc.clone()),
+            Some(Location::Fs(font))
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! ratatui rendering: two browser panels above a player bar.
 
 use crate::app::{App, Panel, PlayState};
+use crate::history;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -30,6 +31,9 @@ pub fn draw(f: &mut App, frame: &mut Frame) {
     draw_player(f, frame, rows[1]);
     draw_hints(f, frame, rows[2]);
 
+    if f.hist.is_some() {
+        draw_history(f, frame, area);
+    }
     if f.show_help {
         draw_help(frame, area);
     }
@@ -297,11 +301,190 @@ fn draw_hints(app: &App, frame: &mut Frame, area: Rect) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    let hint = "Tab panels  Enter play/load  Space pause  s stop  ←/→ seek  n next-mode  r repeat  </> vol  i go  G playing  / filter  h help  q quit";
+    let hint = "Tab panels  Enter play/load  Space pause  s stop  ←/→ seek  n next-mode  r repeat  </> vol  i go  G playing  R history  / filter  h help  q quit";
     frame.render_widget(
         Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
         area,
     );
+}
+
+/// The playing-history overlay: what was played, through which SoundFont, when.
+/// Rows are newest first; `Tab` switches between the combination view and the
+/// per-track / per-SoundFont groupings of the same log.
+fn draw_history(app: &mut App, frame: &mut Frame, area: Rect) {
+    let (view, filter, filtering, count) = match &app.hist {
+        Some(h) => (h.view, h.filter.clone(), h.filtering, h.rows.len()),
+        None => return,
+    };
+    let total = app.history.len();
+
+    let w = area.width.saturating_sub(4).min(110);
+    // Tall enough for the rows it has (headings + list + detail + borders),
+    // without covering more of the player than it needs to — and never taller
+    // than the terminal, however small that is.
+    let max_h = area.height.saturating_sub(2);
+    let h = (count as u16 + 5).max(6.min(max_h)).min(max_h);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, popup);
+
+    // While filtering the count reads "matches of total", as the panels do.
+    let title = if filtering || !filter.is_empty() {
+        format!(
+            " History — {} · /{filter} · {count} of {total} ",
+            view.title()
+        )
+    } else {
+        format!(" History — {} · {count} ", view.title())
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(Span::styled(
+            " Enter play · Tab view · G reveal · d forget · D erase all · / filter · Esc close ",
+            Style::default().fg(Color::DarkGray),
+        )));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // column headings
+            Constraint::Min(1),    // the list
+            Constraint::Length(2), // full paths of the selected row
+        ])
+        .split(inner);
+
+    let cols = history_columns(inner.width);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            history_row_text("when", "track", "soundfont", "plays", cols),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[0],
+    );
+
+    let now = history::now_secs();
+    let items: Vec<ListItem> = app
+        .hist
+        .as_ref()
+        .map(|hst| {
+            hst.rows
+                .iter()
+                .map(|r| {
+                    // A row whose file has since disappeared is dimmed and
+                    // flagged, rather than silently failing when played.
+                    let gone = r.gone;
+                    let style = if gone {
+                        Style::default().fg(Color::DarkGray)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    let mark = if gone { "!" } else { " " };
+                    ListItem::new(Line::from(Span::styled(
+                        history_row_text(
+                            &format!("{}{}", mark, history::fmt_stamp(r.when, false)),
+                            &name_of(&r.midi),
+                            &name_of(&r.soundfont),
+                            &format!("{}x", r.plays),
+                            cols,
+                        ),
+                        style,
+                    )))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let list = List::default().items(items).highlight_style(
+        Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+    );
+    if let Some(hst) = app.hist.as_mut() {
+        frame.render_stateful_widget(list, rows[1], &mut hst.state);
+    }
+
+    // Detail: the full locations of the selected row, which the columns above
+    // can only show the names of.
+    let detail: Vec<Line> = match app.hist.as_ref().and_then(|h| h.selected()) {
+        Some(r) => {
+            let age = history::fmt_age(now, r.when);
+            vec![
+                detail_line("track", &r.midi, &age),
+                detail_line("font ", &r.soundfont, ""),
+            ]
+        }
+        None => vec![Line::from(Span::styled(
+            "  nothing played yet — press Enter on a MIDI file to start",
+            Style::default().fg(Color::DarkGray),
+        ))],
+    };
+    frame.render_widget(Paragraph::new(detail), rows[2]);
+}
+
+/// Column widths of the history table: timestamp, track, soundfont, plays.
+fn history_columns(width: u16) -> (usize, usize, usize, usize) {
+    let stamp = 17; // "!YYYY-MM-DD HH:MM"
+    let plays = 5;
+    let rest = (width as usize).saturating_sub(stamp + plays + 4); // 4 = gaps
+    let track = rest / 2;
+    (stamp, track, rest.saturating_sub(track), plays)
+}
+
+/// One history table row, padded into the given columns.
+fn history_row_text(
+    when: &str,
+    track: &str,
+    font: &str,
+    plays: &str,
+    cols: (usize, usize, usize, usize),
+) -> String {
+    let (w_when, w_track, w_font, w_plays) = cols;
+    format!(
+        "{} {} {} {:>w$}",
+        truncate_pad(when, w_when),
+        truncate_pad(track, w_track),
+        truncate_pad(font, w_font),
+        plays,
+        w = w_plays
+    )
+}
+
+fn name_of(loc: &Option<crate::vfs::Location>) -> String {
+    loc.as_ref()
+        .map(|l| l.file_name())
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn detail_line<'a>(label: &'a str, loc: &Option<crate::vfs::Location>, suffix: &str) -> Line<'a> {
+    let path = loc
+        .as_ref()
+        .map(|l| l.display())
+        .unwrap_or_else(|| "—".to_string());
+    let mut spans = vec![
+        Span::styled(format!(" {label}  "), Style::default().fg(Color::DarkGray)),
+        Span::styled(path, Style::default().fg(Color::Gray)),
+    ];
+    if !suffix.is_empty() {
+        spans.push(Span::styled(
+            format!("   ({suffix})"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
@@ -319,6 +502,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  U              go up a directory"),
         Line::from("  i              go to directory (Tab completes)"),
         Line::from("  G              jump to playing track / loaded SoundFont"),
+        Line::from("  R              playing history (Enter replays track + SoundFont)"),
         Line::from("  Space / p      pause / resume"),
         Line::from("  s              stop"),
         Line::from("  ← →            seek 5s    [ ]  seek 30s"),
@@ -441,6 +625,59 @@ fn truncate_pad(s: &str, w: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Render the whole UI into an off-screen terminal of the given size and
+    /// return its text, so layout and content can be asserted headlessly.
+    fn rendered(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        terminal.draw(|frame| draw(app, frame)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn history_overlay_shows_the_pair_and_its_timestamp() {
+        use crate::vfs::Location;
+        use std::path::PathBuf;
+
+        let midi_dir = tempfile::tempdir().unwrap();
+        let sf_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            Location::Fs(midi_dir.path().to_path_buf()),
+            Location::Fs(sf_dir.path().to_path_buf()),
+            None,
+        )
+        .expect("app init");
+
+        let when = 1_758_067_400;
+        app.history.record(
+            Some(Location::Fs(PathBuf::from("/m/CANYON.MID"))),
+            Some(Location::Fs(PathBuf::from("/s/CT8MGM.SF2"))),
+            when,
+            true,
+        );
+        app.history_open();
+
+        let out = rendered(&mut app, 100, 24);
+        assert!(out.contains("History"), "{out}");
+        assert!(out.contains("CANYON.MID"), "{out}");
+        assert!(out.contains("CT8MGM.SF2"), "{out}");
+        // The absolute time is on the row, not just a relative age.
+        assert!(out.contains(&history::fmt_stamp(when, false)), "{out}");
+        // The detail lines spell out where each file actually lives.
+        assert!(out.contains("/m/CANYON.MID"), "{out}");
+
+        // A cramped terminal must still render rather than panic on layout.
+        let _ = rendered(&mut app, 24, 6);
+    }
 
     #[test]
     fn stopped_resets_gauge_instead_of_recolouring() {

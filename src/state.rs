@@ -18,7 +18,8 @@ pub struct State {
     pub soundfont: Option<Location>,
 }
 
-fn config_dir() -> Option<PathBuf> {
+/// The directory holding voxfont's session file and playing history.
+pub fn config_dir() -> Option<PathBuf> {
     if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
         if !x.is_empty() {
             return Some(PathBuf::from(x).join("voxfont"));

@@ -36,7 +36,8 @@ plugins, no mouse.
 - **Instant A/B** — swap the SoundFont under the playing track with one keypress.
 - **At a glance** — durations, sizes, live bar·beat, tempo, and a progress bar.
 - **Lightweight** — launches instantly and drives FluidSynth directly.
-- **Remembers** — restores your directories and SoundFont next time.
+- **Remembers** — restores your directories and SoundFont next time, and keeps a
+  history of what you played through what, replayable with one keypress.
 
 ## Build
 
@@ -57,9 +58,10 @@ FLUIDSYNTH_LIB_DIR=/path/to/lib cargo build --release
 ## Run
 
 ```sh
-voxfont [-R <driver>] [MIDI_DIR [SOUNDFONT_DIR]]
+voxfont [-R <driver>] [--no-history] [MIDI_DIR [SOUNDFONT_DIR]]
 ```
 
+- `--no-history` — don't read or write the playing history this run.
 - `-R`, `--driver <driver>` — audio backend, `jack` (default) or `alsa`. When
   given it is used verbatim, with no fallback. When omitted, voxfont uses the
   `VOXFONT_AUDIO_DRIVER` env override if set, otherwise tries jack, pulseaudio,
@@ -75,8 +77,50 @@ Run `voxfont --help` for the full usage summary.
 ### Saved session
 
 On exit, voxfont remembers the two panel directories and the loaded SoundFont,
-and restores them on the next launch. The state is stored at
-`$XDG_CONFIG_HOME/voxfont/state.conf` (default `~/.config/voxfont/state.conf`).
+and restores them on the next launch, with the cursor back on the file you
+played last. When that file lives inside a `.zip`, the panel steps into the
+archive and lands on the file itself rather than stopping at the archive. The
+state is stored at `$XDG_CONFIG_HOME/voxfont/state.conf` (default
+`~/.config/voxfont/state.conf`).
+
+### Playing history
+
+Every combination you listen to for more than a few seconds is remembered: the
+MIDI file, the SoundFont it was heard through, when, and how many times. The
+same file played through two SoundFonts is two separate entries — that is the
+comparison the history exists to preserve.
+
+Press <kbd>R</kbd> for the history, newest at the top:
+
+```
+┌ History — recent · 4 ──────────────────────────────────────────────────────┐
+│when              track                    soundfont                  plays │
+│ 2026-09-17 18:11 CANYON.MID               CT8MGM.SF2                    3x │
+│ 2026-09-17 18:05 CANYON.MID               FluidR3_GM.sf2                1x │
+│!2026-09-17 17:23 bwv1041.mid              RolandSC55.sf2                1x │
+│ 2026-09-16 17:13 —                        2MBGMGS.SF2                   2x │
+│ track  /home/me/midi/CANYON.MID   (2 min ago)                              │
+│ font   /srv/sf2/CT8MGM.SF2                                                 │
+└ Enter play · Tab view · G reveal · d forget · D erase all · / filter ──────┘
+```
+
+| Key | Action |
+| --- | --- |
+| `Enter` | replay: load the font, play the track, move the panels onto it |
+| `Tab` | switch view: combinations · one row per track · one per SoundFont |
+| `G` | point both panels at the entry without playing it |
+| `d` | forget the selected entry · `D` erase the whole history (asks twice) |
+| `/` | filter by track or SoundFont name |
+| `Esc` / `q` | close |
+
+A row marked `!` can no longer be played, because the file has moved or been
+deleted. Entries inside a `.zip` archive are stored as archive plus member, so
+they replay straight from the history like any other file.
+
+The history lives beside the session file, in
+`$XDG_CONFIG_HOME/voxfont/history.conf` (default `~/.config/voxfont/`), as plain
+text you can read, edit or delete. It is never sent anywhere. Start voxfont with
+`--no-history` to leave it untouched for a run.
 
 Force a specific audio backend if the default doesn't produce sound:
 
@@ -105,6 +149,7 @@ voxfont --selftest /path/to/font.sf2 /path/to/song.mid
 | `r` | toggle **repeat** mode |
 | `<` `>` | volume −1 / +1 · `,` `.` volume −5 / +5 |
 | `Alt`+`1`…`9` | set volume 10%…90% |
+| `R` | playing history (`Enter` replays the track with its SoundFont) |
 | `H` | toggle hidden files · `Ctrl`+`r` reload panel |
 | `/` or `g` | incremental search in the active panel |
 | `h` / `?` | help · `q` / `Q` quit |

@@ -1,6 +1,7 @@
 mod app;
 mod browser;
 mod fluid;
+mod history;
 mod midi;
 mod state;
 mod ui;
@@ -21,12 +22,13 @@ const USAGE: &str = "\
 voxfont — console MIDI/SoundFont player
 
 Usage:
-    voxfont [-R <driver>] [MIDI_DIR [SOUNDFONT_DIR]]
+    voxfont [-R <driver>] [--no-history] [MIDI_DIR [SOUNDFONT_DIR]]
     voxfont --selftest <soundfont.sf2> <file.mid>
     voxfont -h | --help
 
 Options:
     -R, --driver <driver>   Audio backend: jack (default) or alsa.
+        --no-history        Don't read or write the playing history this run.
 
 Positional arguments (both optional):
     MIDI_DIR                Starting directory for the MIDI panel.
@@ -40,6 +42,8 @@ struct Cli {
     driver: Option<String>,
     midi_dir: Option<String>,
     sf2_dir: Option<String>,
+    /// `--no-history`: keep the session's plays out of the history file.
+    no_history: bool,
 }
 
 /// Hand-rolled parser (no external dependency, matching the project's lean
@@ -47,6 +51,7 @@ struct Cli {
 /// the MIDI and SoundFont directories. Returns `Err(message)` on misuse.
 fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut driver = None;
+    let mut no_history = false;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -75,6 +80,10 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 }
                 i += 1;
             }
+            "--no-history" => {
+                no_history = true;
+                i += 1;
+            }
             "--" => {
                 positional.extend(args[i + 1..].iter().cloned());
                 break;
@@ -98,6 +107,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         driver,
         midi_dir: it.next(),
         sf2_dir: it.next(),
+        no_history,
     })
 }
 
@@ -181,17 +191,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.message = Some(warnings.join("; "));
     }
 
+    // Load the playing history. `App` starts with an in-memory one that is never
+    // written, so `--no-history` (and every test) simply leaves it in place.
+    if !cli.no_history {
+        app.history = history::History::load();
+    }
+
     // Seed the remembered file (before any load, which would re-save state) and
     // put the MIDI cursor on it if it is in the opened directory.
     app.last_played = saved.midi_file.clone();
     if let Some(f) = saved.midi_file.filter(|l| l.exists()) {
-        app.midi.select_loc(&f);
+        app.midi.select_deep(&f);
     }
 
     // Reload the last SoundFont if it still exists, landing the cursor on it.
     if let Some(sf) = saved.soundfont.filter(|l| l.exists()) {
-        app.sf2.select_loc(&sf);
-        app.load_soundfont(sf);
+        app.sf2.select_deep(&sf);
+        app.restore_soundfont(sf);
     }
 
     // Restore the terminal even if we panic.
@@ -204,8 +220,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = setup_terminal()?;
     let res = run(&mut terminal, &mut app);
     restore_terminal()?;
-    // Persist the final directories and loaded SoundFont for next launch.
+    // Persist the final directories and loaded SoundFont for next launch, plus
+    // whatever was still playing when the user quit.
     app.save_state();
+    app.finish_history();
     res?;
     Ok(())
 }
@@ -311,6 +329,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // History overlay.
+    if app.hist.is_some() {
+        handle_history_key(app, key);
+        return;
+    }
+
     // "Go to directory" prompt.
     if app.goto.is_some() {
         handle_goto_key(app, key);
@@ -343,6 +367,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('i') => app.start_goto(),
         // Jump to the currently playing MIDI / loaded SoundFont.
         KeyCode::Char('G') => app.goto_current(),
+        // Playing history.
+        KeyCode::Char('R') => app.history_open(),
 
         KeyCode::Char('p') | KeyCode::Char(' ') => app.toggle_pause(),
         KeyCode::Char('s') => app.stop(),
@@ -370,6 +396,57 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
         KeyCode::Char('h') | KeyCode::Char('?') => app.show_help = true,
 
+        _ => {}
+    }
+}
+
+/// Keys while the history overlay is open. `Enter` replays the selected entry
+/// with its SoundFont; the overlay otherwise navigates like a panel.
+fn handle_history_key(app: &mut App, key: KeyEvent) {
+    // `/` filter mode captures printable keys; cursor keys still move.
+    if app.history_filtering() {
+        match key.code {
+            KeyCode::Esc => app.history_filter_cancel(),
+            KeyCode::Enter => app.history_restore(),
+            KeyCode::Backspace => app.history_filter_backspace(),
+            KeyCode::Char(c) => app.history_filter_push(c),
+            _ => history_move_key(app, key),
+        }
+        return;
+    }
+
+    // Any key other than a second `D` takes back the "erase everything" prompt.
+    if key.code != KeyCode::Char('D') {
+        app.history_cancel_confirm();
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char('R') => {
+            app.history_close()
+        }
+        KeyCode::Enter => app.history_restore(),
+        KeyCode::Tab | KeyCode::BackTab => app.history_cycle_view(),
+        KeyCode::Char('G') => app.history_reveal(),
+        KeyCode::Char('d') => app.history_forget(),
+        KeyCode::Char('D') => app.history_clear(),
+        KeyCode::Char('/') | KeyCode::Char('g') => app.history_start_filter(),
+        _ => history_move_key(app, key),
+    }
+}
+
+/// Cursor movement inside the history overlay, shared by both its modes.
+fn history_move_key(app: &mut App, key: KeyEvent) {
+    let hist = match app.hist.as_mut() {
+        Some(h) => h,
+        None => return,
+    };
+    match key.code {
+        KeyCode::Up => hist.move_up(1),
+        KeyCode::Down => hist.move_down(1),
+        KeyCode::PageUp => hist.move_up(10),
+        KeyCode::PageDown => hist.move_down(10),
+        KeyCode::Home => hist.home(),
+        KeyCode::End => hist.end(),
         _ => {}
     }
 }
@@ -445,6 +522,14 @@ mod tests {
         assert!(parse_args(&s(&["-R", "oss"])).is_err());
         assert!(parse_args(&s(&["-R"])).is_err());
         assert!(parse_args(&s(&["--driver=oss"])).is_err());
+    }
+
+    #[test]
+    fn parses_no_history_flag() {
+        let c = parse_args(&s(&["--no-history", "/midi"])).unwrap();
+        assert!(c.no_history);
+        assert_eq!(c.midi_dir.as_deref(), Some("/midi"));
+        assert!(!parse_args(&s(&["/midi"])).unwrap().no_history);
     }
 
     #[test]

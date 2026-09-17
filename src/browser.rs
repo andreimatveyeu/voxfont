@@ -216,6 +216,19 @@ impl Browser {
         }
     }
 
+    /// Put the cursor on `loc`, stepping down into subdirectories and archives
+    /// when it lives somewhere below the current directory — so a file inside a
+    /// zip is reached inside the zip, not left at the archive. A location
+    /// outside the current directory leaves the panel where it is, which keeps
+    /// the restored session directory in charge at launch.
+    pub fn select_deep(&mut self, loc: &Location) {
+        if self.dir.contains(loc) {
+            self.reveal(loc);
+        } else {
+            self.select_loc(loc);
+        }
+    }
+
     /// Navigate to `loc`'s containing directory/archive (if not already there)
     /// and move the cursor onto it. Spans filesystem directories and zip
     /// archives, since the container is resolved through [`Location::parent`].
@@ -579,6 +592,51 @@ mod tests {
         // It should have descended into "sub" and put the cursor on the file.
         assert_eq!(b.dir, Location::Fs(d.path().join("sub")));
         assert_eq!(b.selected().unwrap().loc, target);
+    }
+
+    #[test]
+    fn select_deep_steps_into_the_zip_holding_the_file() {
+        let d = tempdir().unwrap();
+        let zip = d.path().join("songs.zip");
+        make_zip(&zip, &["a/x.mid", "top.mid"]);
+        fs::write(d.path().join("loose.mid"), b"x").unwrap();
+        let member = |inner: &str| Location::Zip {
+            archive: zip.clone(),
+            inner: inner.to_string(),
+        };
+
+        // From the filesystem directory, the cursor descends all the way to the
+        // file inside the archive rather than stopping at the archive itself.
+        let mut b = Browser::new_at(Location::Fs(d.path().to_path_buf()), &["mid"], false, true);
+        b.select_deep(&member("a/x.mid"));
+        assert_eq!(b.dir, member("a"));
+        assert_eq!(b.selected().unwrap().name, "x.mid");
+
+        // From the archive root, likewise into its subdirectory.
+        let mut b = Browser::new_at(member(""), &["mid"], false, true);
+        b.select_deep(&member("a/x.mid"));
+        assert_eq!(b.dir, member("a"));
+        assert_eq!(b.selected().unwrap().name, "x.mid");
+
+        // A member at the archive root needs no descent, just the cursor.
+        let mut b = Browser::new_at(member(""), &["mid"], false, true);
+        b.select_deep(&member("top.mid"));
+        assert_eq!(b.dir, member(""));
+        assert_eq!(b.selected().unwrap().name, "top.mid");
+
+        // A plain file in the current directory still just moves the cursor.
+        let mut b = Browser::new_at(Location::Fs(d.path().to_path_buf()), &["mid"], false, true);
+        b.select_deep(&Location::Fs(d.path().join("loose.mid")));
+        assert_eq!(b.dir, Location::Fs(d.path().to_path_buf()));
+        assert_eq!(b.selected().unwrap().name, "loose.mid");
+
+        // A file outside the opened directory leaves the panel alone, so the
+        // restored (or command-line) directory stays in charge.
+        let other = tempdir().unwrap();
+        fs::write(other.path().join("elsewhere.mid"), b"x").unwrap();
+        let mut b = Browser::new_at(Location::Fs(d.path().to_path_buf()), &["mid"], false, true);
+        b.select_deep(&Location::Fs(other.path().join("elsewhere.mid")));
+        assert_eq!(b.dir, Location::Fs(d.path().to_path_buf()));
     }
 
     #[test]

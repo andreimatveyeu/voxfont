@@ -267,6 +267,10 @@ being open. Items that cannot play are skipped rather than dropped, whether thei
 files have gone (marked `!`) or they are unpinned and you have not chosen a font
 yet.
 
+Unlike the history and the favourites, whose queues move the panels onto each
+entry as it plays, the playlist leaves the panels where they were — in the
+folder you opened it from. <kbd>G</kbd> still points them at an item.
+
 #### Playlist file format
 
 The format is extended M3U, so a plain list of MIDI paths from any other tool

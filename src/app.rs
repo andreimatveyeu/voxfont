@@ -861,6 +861,15 @@ impl App {
                 self.load_font(sf.clone(), false);
             }
         }
+        // The history and the favourites point back at files that live
+        // somewhere, so the panels follow each entry there, as they do when
+        // one is picked with Enter. A playlist does not move them.
+        if matches!(step.origin, Origin::History(_) | Origin::Favourite(_)) {
+            self.midi.reveal(&step.midi);
+            if let Some(sf) = &step.soundfont {
+                self.sf2.reveal(sf);
+            }
+        }
         match (step.origin, step.soundfont) {
             (Origin::History(i), _) => {
                 if let PlaySource::History { idx, .. } = &mut self.play_source {
@@ -1322,8 +1331,9 @@ impl App {
             Some(id) => id,
             None => return,
         };
-        self.midi.reveal(&item.midi);
-        self.sf2.reveal(&font);
+        // Unlike the history and the favourites, the panels stay where they
+        // are: a playlist is a list in its own right, and the directory it was
+        // opened from is where the user means to be when they close it.
         self.play_step(Step {
             midi: item.midi,
             soundfont: Some(font),
@@ -2845,5 +2855,67 @@ mod tests {
         assert_eq!(app.overlay_source(), Some(Source::Playlist));
         assert!(app.message.as_ref().unwrap().contains("1 line ignored"));
         assert!(app.now_playing.is_none(), "opening does not play");
+    }
+
+    /// A test app whose track and font sit one directory below where the
+    /// panels start, so following them means the panels change directory.
+    fn nested_app() -> (
+        App,
+        Location,
+        Location,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let (mut app, midi_dir, sf_dir) = test_app();
+        let msub = midi_dir.path().join("sub");
+        let ssub = sf_dir.path().join("fonts");
+        std::fs::create_dir(&msub).unwrap();
+        std::fs::create_dir(&ssub).unwrap();
+        std::fs::write(msub.join("song.mid"), b"x").unwrap();
+        std::fs::write(msub.join("next.mid"), b"x").unwrap();
+        std::fs::write(ssub.join("piano.sf2"), b"x").unwrap();
+        app.midi.refresh();
+        app.sf2.refresh();
+        let track = Location::Fs(msub.join("song.mid"));
+        let font = Location::Fs(ssub.join("piano.sf2"));
+        (app, track, font, midi_dir, sf_dir)
+    }
+
+    #[test]
+    fn playing_the_playlist_leaves_the_panels_where_they_are() {
+        let (mut app, track, font, midi_dir, sf_dir) = nested_app();
+        let next = Location::Fs(midi_dir.path().join("sub/next.mid"));
+        app.playlist.push(track, Some(font.clone()));
+        app.playlist.push(next, None);
+        app.user_font = Some(font);
+
+        app.play_playlist_at(0);
+        assert_eq!(app.queue_position(), Some((Source::Playlist, 1, 2)));
+        let step = app.next_playlist_item(list_id(&app, 0), 0).expect("next");
+        app.play_step(step);
+        assert_eq!(app.queue_position(), Some((Source::Playlist, 2, 2)));
+
+        assert_eq!(
+            app.midi.location(),
+            Location::Fs(midi_dir.path().to_path_buf())
+        );
+        assert_eq!(
+            app.sf2.location(),
+            Location::Fs(sf_dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn the_history_and_favourites_queues_move_the_panels_onto_each_entry() {
+        for origin in [Origin::History(0), Origin::Favourite(0)] {
+            let (mut app, track, font, _m, _s) = nested_app();
+            app.play_step(Step {
+                midi: track.clone(),
+                soundfont: Some(font.clone()),
+                origin,
+            });
+            assert_eq!(app.midi.selected().map(|e| e.loc.clone()), Some(track));
+            assert_eq!(app.sf2.selected().map(|e| e.loc.clone()), Some(font));
+        }
     }
 }

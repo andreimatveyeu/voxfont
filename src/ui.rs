@@ -1,7 +1,8 @@
 //! ratatui rendering: two browser panels above a player bar.
 
-use crate::app::{App, Panel, PlayState, Source};
+use crate::app::{App, Panel, PlayState, PromptKind, Source};
 use crate::history;
+use crate::playlist;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -100,6 +101,9 @@ fn draw_panel(app: &mut App, frame: &mut Frame, area: Rect, panel: Panel, title:
                         .fg(Color::Blue)
                         .add_modifier(Modifier::BOLD),
                 )
+            } else if panel == Panel::Midi && playlist::is_playlist_name(&e.name) {
+                // A playlist opens rather than plays.
+                (" ≡ ", Style::default().fg(Color::Magenta))
             } else {
                 ("   ", Style::default().fg(Color::White))
             };
@@ -258,11 +262,15 @@ fn draw_player(app: &App, frame: &mut Frame, area: Rect) {
         " Fav ",
         if app.current_is_favourite() { on } else { off },
     ));
-    // While the favourites are the queue, show how far along it is.
-    if let Some((at, n)) = app.playlist_position() {
+    // While the favourites or the playlist are the queue, show how far along.
+    if let Some((source, at, n)) = app.queue_position() {
+        let label = match source {
+            Source::Playlist => "List",
+            _ => "Favs",
+        };
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            format!(" Favs {at}/{n} "),
+            format!(" {label} {at}/{n} "),
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Magenta)
@@ -305,26 +313,33 @@ fn gauge_appearance(state: PlayState, progress: f64, state_col: Color) -> (f64, 
 }
 
 fn draw_hints(app: &App, frame: &mut Frame, area: Rect) {
-    // When the GO prompt is open it takes over this line.
-    if let Some(path) = &app.goto {
+    // When the path prompt is open it takes over this line.
+    if let Some(prompt) = &app.prompt {
+        let (label, keys) = match prompt.kind {
+            PromptKind::Goto => (
+                "GO: ",
+                "   (Tab: complete  Alt+⌫: up  Enter: go  Esc: cancel)",
+            ),
+            PromptKind::SavePlaylist => (
+                "SAVE PLAYLIST: ",
+                "   (Tab: complete  Enter: save  Esc: cancel)",
+            ),
+        };
         let line = Line::from(vec![
             Span::styled(
-                "GO: ",
+                label,
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("{path}█"), Style::default().fg(Color::Cyan)),
-            Span::styled(
-                "   (Tab: complete  Alt+⌫: up  Enter: go  Esc: cancel)",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(format!("{}█", prompt.buf), Style::default().fg(Color::Cyan)),
+            Span::styled(keys, Style::default().fg(Color::DarkGray)),
         ]);
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    let hint = "Tab panels  Enter play/load  Space pause  s stop  ←/→ seek  n next-mode  r repeat  </> vol  i go  G playing  R history  f star  F favs  / filter  h help  q quit";
+    let hint = "Tab panels  Enter play/load  Space pause  s stop  ←/→ seek  n next-mode  r repeat  </> vol  i go  G playing  R history  f star  F favs  P playlist  a add  / filter  h help  q quit";
     frame.render_widget(
         Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
         area,
@@ -336,7 +351,8 @@ fn draw_hints(app: &App, frame: &mut Frame, area: Rect) {
 /// For the history that is what was played, through which font and when, newest
 /// first, with `Tab` switching between the combination view and the per-track /
 /// per-SoundFont groupings of the same log. For the favourites it is the starred
-/// pairs in playlist order, which `Shift`+`↑`/`↓` reorders.
+/// pairs in playlist order, and for the playlist its items in order; in both
+/// `Shift`+`↑`/`↓` reorders.
 fn draw_overlay(app: &mut App, frame: &mut Frame, area: Rect) {
     let (source, view, filter, filtering, count) = match &app.overlay {
         Some(o) => (
@@ -351,6 +367,7 @@ fn draw_overlay(app: &mut App, frame: &mut Frame, area: Rect) {
     let total = match source {
         Source::History => app.history.len(),
         Source::Favourites => app.favs.len(),
+        Source::Playlist => app.playlist.len(),
     };
 
     let w = area.width.saturating_sub(4).min(110);
@@ -370,12 +387,19 @@ fn draw_overlay(app: &mut App, frame: &mut Frame, area: Rect) {
     let heading = match source {
         Source::History => format!("History — {}", view.title()),
         Source::Favourites => "Favourites".to_string(),
+        Source::Playlist => format!("Playlist — {}", app.playlist.name()),
+    };
+    // Saving the playlist is explicit, so say when there is something to save.
+    let modified = if source == Source::Playlist && app.playlist.is_dirty() {
+        " · modified"
+    } else {
+        ""
     };
     // While filtering the count reads "matches of total", as the panels do.
     let title = if filtering || !filter.is_empty() {
-        format!(" {heading} · /{filter} · {count} of {total} ")
+        format!(" {heading} · /{filter} · {count} of {total}{modified} ")
     } else {
-        format!(" {heading} · {count} ")
+        format!(" {heading} · {count}{modified} ")
     };
     let hint = match source {
         Source::History => {
@@ -383,6 +407,9 @@ fn draw_overlay(app: &mut App, frame: &mut Frame, area: Rect) {
         }
         Source::Favourites => {
             " Enter play from here · ⇧↑↓ move · d remove · G reveal · / filter · Esc close "
+        }
+        Source::Playlist => {
+            " Enter play from here · ⇧↑↓ move · s set font · x clear font · d remove · w save · W save as · / filter "
         }
     };
     let block = Block::default()
@@ -410,10 +437,11 @@ fn draw_overlay(app: &mut App, frame: &mut Frame, area: Rect) {
         ])
         .split(inner);
 
-    let cols = history_columns(inner.width);
+    let cols = history_columns(inner.width, source);
     let when_heading = match source {
         Source::History => "when",
         Source::Favourites => "starred",
+        Source::Playlist => "     #",
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -427,6 +455,12 @@ fn draw_overlay(app: &mut App, frame: &mut Frame, area: Rect) {
     // Precomputed here rather than per row: the favourites overlay marks the
     // row that is playing, the history overlay marks the rows that are starred.
     let playing = (app.now_playing.clone(), app.soundfont.clone());
+    // A playlist may hold the same pair twice, so its playing row is the one
+    // at the queue's position, not every row that matches what is heard.
+    let playing_item = match app.queue_position() {
+        Some((Source::Playlist, at, _)) => Some(at - 1),
+        _ => None,
+    };
     let items: Vec<ListItem> = app
         .overlay
         .as_ref()
@@ -437,7 +471,11 @@ fn draw_overlay(app: &mut App, frame: &mut Frame, area: Rect) {
                     // A row whose file has since disappeared is dimmed and
                     // flagged, rather than silently failing when played.
                     let gone = r.gone;
-                    let is_playing = !gone && (r.midi.clone(), r.soundfont.clone()) == playing;
+                    let is_playing = !gone
+                        && match source {
+                            Source::Playlist => playing_item == r.idxs.first().copied(),
+                            _ => (r.midi.clone(), r.soundfont.clone()) == playing,
+                        };
                     let style = match (gone, is_playing) {
                         (true, _) => Style::default().fg(Color::DarkGray),
                         (false, true) => Style::default()
@@ -456,6 +494,15 @@ fn draw_overlay(app: &mut App, frame: &mut Frame, area: Rect) {
                                 " "
                             }
                         }
+                        (Source::Playlist, true) => "♪",
+                        // An item without a font is starred through the
+                        // font it plays through.
+                        (Source::Playlist, false) => {
+                            match (&r.midi, r.soundfont.as_ref().or(app.user_font.as_ref())) {
+                                (Some(m), Some(sf)) if app.favs.is_pair(m, sf) => "★",
+                                _ => " ",
+                            }
+                        }
                         (Source::History, _) => match (&r.midi, &r.soundfont) {
                             (Some(m), Some(sf)) if app.favs.is_pair(m, sf) => "★",
                             _ => " ",
@@ -467,11 +514,21 @@ fn draw_overlay(app: &mut App, frame: &mut Frame, area: Rect) {
                         0 => String::new(),
                         n => format!("{n}x"),
                     };
+                    // The first column is the time for the stores that keep
+                    // one, and the item's number in the playlist.
+                    let first = match source {
+                        Source::Playlist => format!("{:>4}", r.idxs[0] + 1),
+                        _ => history::fmt_stamp(r.when, false),
+                    };
+                    let font = match (source, &r.soundfont) {
+                        (Source::Playlist, None) => "(your font)".to_string(),
+                        _ => name_of(&r.soundfont),
+                    };
                     ListItem::new(Line::from(Span::styled(
                         history_row_text(
-                            &format!("{}{}", mark, history::fmt_stamp(r.when, false)),
+                            &format!("{mark}{first}"),
                             &name_of(&r.midi),
-                            &name_of(&r.soundfont),
+                            &font,
                             &plays,
                             cols,
                         ),
@@ -495,6 +552,14 @@ fn draw_overlay(app: &mut App, frame: &mut Frame, area: Rect) {
     // Detail: the full locations of the selected row, which the columns above
     // can only show the names of.
     let detail: Vec<Line> = match app.overlay.as_ref().and_then(|o| o.selected()) {
+        Some(r) if source == Source::Playlist => {
+            let font = match (&r.soundfont, &app.user_font) {
+                (Some(_), _) => detail_line("font ", &r.soundfont, ""),
+                (None, Some(_)) => detail_line("font ", &app.user_font, "your font"),
+                (None, None) => detail_line("font ", &None, "your font — none loaded yet"),
+            };
+            vec![detail_line("track", &r.midi, ""), font]
+        }
         Some(r) => {
             let age = history::fmt_age(now, r.when);
             vec![
@@ -506,6 +571,9 @@ fn draw_overlay(app: &mut App, frame: &mut Frame, area: Rect) {
             match source {
                 Source::History => "  nothing played yet — press Enter on a MIDI file to start",
                 Source::Favourites => "  nothing starred yet — press f while a track is playing",
+                Source::Playlist => {
+                    "  empty — press a on a MIDI file to add it, A to add it with the loaded SoundFont"
+                }
             },
             Style::default().fg(Color::DarkGray),
         ))],
@@ -513,9 +581,13 @@ fn draw_overlay(app: &mut App, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(detail), rows[2]);
 }
 
-/// Column widths of the overlay table: timestamp, track, soundfont, plays.
-fn history_columns(width: u16) -> (usize, usize, usize, usize) {
-    let stamp = 18; // "!★YYYY-MM-DD HH:MM"
+/// Column widths of the overlay table: timestamp (or item number), track,
+/// soundfont, plays.
+fn history_columns(width: u16, source: Source) -> (usize, usize, usize, usize) {
+    let stamp = match source {
+        Source::Playlist => 6, // "!♪ 123"
+        _ => 18,               // "!★YYYY-MM-DD HH:MM"
+    };
     let plays = 5;
     let rest = (width as usize).saturating_sub(stamp + plays + 4); // 4 = gaps
     let track = rest / 2;
@@ -583,6 +655,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  R              playing history (Enter replays track + SoundFont)"),
         Line::from("  f              star the track + SoundFont being heard"),
         Line::from("  F              favourites — Enter plays the list from there"),
+        Line::from("  P              playlist — Enter plays it from there, w saves"),
+        Line::from("  a / A          add MIDI file to the playlist (A: with loaded font)"),
         Line::from("  Space / p      pause / resume"),
         Line::from("  s              stop"),
         Line::from("  ← →            seek 5s    [ ]  seek 30s"),
@@ -804,6 +878,48 @@ mod tests {
         assert_eq!(out.matches('♪').count(), 3, "{out}");
 
         // A cramped terminal must still render rather than panic on layout.
+        let _ = rendered(&mut app, 24, 6);
+    }
+
+    #[test]
+    fn the_playlist_shows_in_the_panel_and_overlay() {
+        use crate::vfs::Location;
+
+        let midi_dir = tempfile::tempdir().unwrap();
+        let sf_dir = tempfile::tempdir().unwrap();
+        let track = midi_dir.path().join("CANYON.MID");
+        let font = sf_dir.path().join("CT8MGM.SF2");
+        std::fs::write(&track, b"x").unwrap();
+        std::fs::write(&font, b"x").unwrap();
+        std::fs::write(midi_dir.path().join("evening.m3u"), b"").unwrap();
+
+        let mut app = App::new(
+            Location::Fs(midi_dir.path().to_path_buf()),
+            Location::Fs(sf_dir.path().to_path_buf()),
+            None,
+        )
+        .expect("app init");
+        // The playlist file is listed with its own marker.
+        let out = rendered(&mut app, 100, 24);
+        assert!(out.contains(" ≡  evening.m3u"), "{out}");
+
+        app.playlist
+            .push(Location::Fs(track.clone()), Some(Location::Fs(font)));
+        app.playlist.push(Location::Fs(track), None);
+        app.playlist_open();
+        let out = rendered(&mut app, 110, 24);
+        assert!(out.contains("Playlist — untitled · 2 · modified"), "{out}");
+        assert!(out.contains("CT8MGM.SF2"), "{out}");
+        assert!(out.contains("(your font)"), "{out}");
+        assert!(out.contains("s set font"), "{out}");
+        // The first column numbers the items.
+        assert!(out.contains("     1 CANYON.MID"), "{out}");
+
+        // The save prompt takes over the bottom line.
+        app.overlay_save(false);
+        let out = rendered(&mut app, 110, 24);
+        assert!(out.contains("SAVE PLAYLIST: "), "{out}");
+
         let _ = rendered(&mut app, 24, 6);
     }
 

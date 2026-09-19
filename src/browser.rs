@@ -34,6 +34,11 @@ pub struct Browser {
     pub state: ListState,
     /// Lower-case extensions (without dot) that should be shown as files.
     exts: Vec<String>,
+    /// Extensions listed as files but never played: the MIDI panel shows
+    /// playlists, which open rather than play, and must not be picked up as
+    /// the next track. Filesystem only — a playlist inside an archive would
+    /// have no directory for its relative paths to resolve against.
+    listed_exts: Vec<String>,
     pub show_hidden: bool,
     /// When true, parse MIDI files to report their duration.
     compute_duration: bool,
@@ -62,6 +67,7 @@ impl Browser {
             filter: String::new(),
             state: ListState::default(),
             exts: exts.iter().map(|s| s.to_lowercase()).collect(),
+            listed_exts: Vec::new(),
             show_hidden: false,
             compute_duration,
             allow_archives,
@@ -70,6 +76,14 @@ impl Browser {
         };
         b.refresh();
         b
+    }
+
+    /// Also list files with these extensions, without treating them as
+    /// playable (see `listed_exts`).
+    pub fn also_listing(mut self, exts: &[&str]) -> Browser {
+        self.listed_exts = exts.iter().map(|s| s.to_lowercase()).collect();
+        self.refresh();
+        self
     }
 
     pub fn refresh(&mut self) {
@@ -90,11 +104,14 @@ impl Browser {
                     size: c.size,
                     duration: None,
                 });
-            } else if self.matches_ext(&c.name) {
+            } else if self.matches_ext(&c.name)
+                || (c.loc.as_fs().is_some() && ext_in(&c.name, &self.listed_exts))
+            {
                 // Duration is only computed for filesystem files. Inside an
                 // archive it would mean decompressing every member just to draw
                 // the list, so the duration column is left blank there.
-                let duration = match (self.compute_duration, c.loc.as_fs()) {
+                let playable = self.matches_ext(&c.name);
+                let duration = match (self.compute_duration && playable, c.loc.as_fs()) {
                     (true, Some(p)) => {
                         let p = p.to_path_buf();
                         *self
@@ -173,10 +190,7 @@ impl Browser {
     }
 
     fn matches_ext(&self, name: &str) -> bool {
-        match Path::new(name).extension().and_then(|e| e.to_str()) {
-            Some(e) => self.exts.iter().any(|x| x == &e.to_lowercase()),
-            None => false,
-        }
+        ext_in(name, &self.exts)
     }
 
     pub fn selected(&self) -> Option<&Entry> {
@@ -362,6 +376,14 @@ impl Browser {
     }
 }
 
+/// True when `name`'s extension is one of the lower-case `exts`.
+fn ext_in(name: &str, exts: &[String]) -> bool {
+    match Path::new(name).extension().and_then(|e| e.to_str()) {
+        Some(e) => exts.iter().any(|x| x == &e.to_lowercase()),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Browser;
@@ -449,6 +471,20 @@ mod tests {
         let b = Browser::new_at(Location::Fs(d.path().to_path_buf()), &["mid"], false, false);
         let e = b.entries.iter().find(|e| e.name == "song.mid").unwrap();
         assert!(e.duration.is_none());
+    }
+
+    #[test]
+    fn listed_files_show_but_are_never_the_next_track() {
+        let d = tempdir().unwrap();
+        for n in ["a.mid", "b.m3u", "c.mid"] {
+            fs::write(d.path().join(n), b"x").unwrap();
+        }
+        let mut b = Browser::new_at(Location::Fs(d.path().to_path_buf()), &["mid"], true, false)
+            .also_listing(&["m3u"]);
+        assert_eq!(names(&b), ["a.mid", "b.m3u", "c.mid"]);
+        let loc = |n: &str| Location::Fs(d.path().join(n));
+        // Auto-advance steps over the playlist to the next track.
+        assert_eq!(b.neighbour_file(&loc("a.mid"), true), Some(loc("c.mid")));
     }
 
     #[test]

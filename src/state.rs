@@ -1,5 +1,5 @@
 //! Persistence of the last session: the MIDI and SoundFont directories, the
-//! last-played MIDI file, and the loaded SoundFont. Stored as a tiny
+//! last-played MIDI file, the loaded SoundFont and the open playlist. Stored as a tiny
 //! `key = value` file under the XDG config directory
 //! (`$XDG_CONFIG_HOME/voxfont/state.conf`, default `~/.config/...`).
 //!
@@ -17,6 +17,8 @@ pub struct State {
     pub midi_file: Option<Location>,
     pub sf2_dir: Option<Location>,
     pub soundfont: Option<Location>,
+    /// The playlist file that was open, reopened (not played) on launch.
+    pub playlist: Option<PathBuf>,
 }
 
 /// Write via a temporary file in the same directory plus a rename, so an
@@ -96,6 +98,10 @@ fn parse_conf(text: &str) -> State {
             continue;
         }
         if let Some((key, val)) = line.split_once('=') {
+            if key.trim() == "playlist" {
+                state.playlist = Some(PathBuf::from(val.trim()));
+                continue;
+            }
             let val = Location::decode(val.trim());
             match key.trim() {
                 "midi_dir" => state.midi_dir = Some(val),
@@ -124,6 +130,9 @@ fn serialize(state: &State) -> String {
     line("midi_file", &state.midi_file);
     line("sf2_dir", &state.sf2_dir);
     line("soundfont", &state.soundfont);
+    if let Some(p) = &state.playlist {
+        out.push_str(&format!("playlist = {}\n", p.to_string_lossy()));
+    }
     out
 }
 
@@ -152,12 +161,14 @@ mod tests {
             }),
             sf2_dir: fs("/srv/sf2"),
             soundfont: fs("/srv/sf2/CT8MGM.SF2"),
+            playlist: Some(PathBuf::from("/home/me/lists/evening.m3u")),
         };
         let parsed = parse_conf(&serialize(&state));
         assert_eq!(parsed.midi_dir, state.midi_dir);
         assert_eq!(parsed.midi_file, state.midi_file);
         assert_eq!(parsed.sf2_dir, state.sf2_dir);
         assert_eq!(parsed.soundfont, state.soundfont);
+        assert_eq!(parsed.playlist, state.playlist);
     }
 
     #[test]
@@ -171,6 +182,7 @@ mod tests {
         assert!(!out.contains("midi_file"));
         assert!(!out.contains("sf2_dir"));
         assert!(!out.contains("soundfont"));
+        assert!(!out.contains("playlist"));
     }
 
     #[test]

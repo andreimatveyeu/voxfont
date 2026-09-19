@@ -40,6 +40,8 @@ plugins, no mouse.
   history of what you played through what, replayable with one keypress.
 - **Favourites** — star a track-and-SoundFont pairing you like, and play the
   starred list back as a playlist, each entry through its own SoundFont.
+- **Playlists** — plain `.m3u` files you can build in voxfont or write by hand,
+  where any item can be pinned to a SoundFont of its own.
 
 ## Build
 
@@ -60,10 +62,13 @@ FLUIDSYNTH_LIB_DIR=/path/to/lib cargo build --release
 ## Run
 
 ```sh
-voxfont [-R <driver>] [--no-history] [MIDI_DIR [SOUNDFONT_DIR]]
+voxfont [-R <driver>] [--no-history] [-p <playlist>] [MIDI_DIR [SOUNDFONT_DIR]]
 ```
 
 - `--no-history` — don't read or write the playing history this run.
+- `-p`, `--playlist <file>` — open this playlist in the playlist overlay. It is
+  shown, not played: press <kbd>Enter</kbd> on an item to start. Without `-p`,
+  the playlist that was open at the end of the last session is reopened.
 - `-R`, `--driver <driver>` — audio backend, `jack` (default) or `alsa`. When
   given it is used verbatim, with no fallback. When omitted, voxfont uses the
   `VOXFONT_AUDIO_DRIVER` env override if set, otherwise tries jack, pulseaudio,
@@ -78,8 +83,8 @@ Run `voxfont --help` for the full usage summary.
 
 ### Saved session
 
-On exit, voxfont remembers the two panel directories and the loaded SoundFont,
-and restores them on the next launch, with the cursor back on the file you
+On exit, voxfont remembers the two panel directories, the loaded SoundFont and
+the open playlist file, and restores them on the next launch, with the cursor back on the file you
 played last. When that file lives inside a `.zip`, the panel steps into the
 archive and lands on the file itself rather than stopping at the archive. The
 state is stored at `$XDG_CONFIG_HOME/voxfont/state.conf` (default
@@ -189,6 +194,132 @@ file's order *is* the playlist order. `--no-history` does not touch them:
 starring is a deliberate act, not a recording of what happened to play. There is
 no "erase all" key — every favourite was starred by hand.
 
+### Playlists
+
+A playlist is an ordinary `.m3u` file. Each item is a MIDI track, and an item
+may be **pinned** to a SoundFont of its own or left **unpinned**. An unpinned
+item plays through *your font*: the SoundFont you last chose — in the
+SoundFont panel, or by replaying a history entry or favourite — or the one
+restored from your last session. Fonts that the list loads for pinned items
+never change your font, so in
+
+```
+1  CANYON.MID    RolandSC55.sf2
+2  popcorn.mid   (your font)
+```
+
+item 2 plays through whatever you had chosen, not through Roland. Loading a
+font by hand while the list plays swaps it under the current track, as always,
+and makes it your font from then on.
+
+`.m3u` files show in the MIDI panel with a `≡`. <kbd>Enter</kbd> on one opens
+it in the playlist overlay without playing it; <kbd>P</kbd> opens the overlay
+for the playlist already open.
+
+```
+┌ Playlist — Evening A/B · 4 · modified ─────────────────────────────────────┐
+│     # track                          soundfont                       plays │
+│ ♪   1 CANYON.MID                     CT8MGM.SF2                         3x │
+│     2 CANYON.MID                     RolandSC55.sf2                        │
+│     3 bwv1041.mid                    (your font)                        1x │
+│!    4 popcorn.mid                    (your font)                           │
+│ track  /home/me/midi/CANYON.MID                                            │
+│ font   /srv/sf2/CT8MGM.SF2                                                 │
+└ Enter play from here · ⇧↑↓ move · s set font · x clear font · d remove … ──┘
+```
+
+| Key | Action |
+| --- | --- |
+| `Enter` | play the list from this item on |
+| `Shift`+`↑` `↓` | move the item up or down (`K` / `J` too) |
+| `s` | pin the loaded SoundFont to the item |
+| `x` | unpin the item, so it plays through your font |
+| `d` | remove the item |
+| `f` | star the item's track and the font it plays through |
+| `G` | point both panels at the item without playing it |
+| `w` | save · `W` save as a new file |
+| `/` | filter by track or SoundFont name |
+| `Esc` / `q` | close |
+
+To build a list, put the cursor on a MIDI file and press <kbd>a</kbd> to add it
+unpinned, or <kbd>A</kbd> to add it pinned to the loaded SoundFont. The cursor
+moves on, so pressing it repeatedly adds a run of tracks. Adding with nothing
+open starts a new, untitled playlist.
+
+Saving is explicit: the overlay title says `modified` until you press
+<kbd>w</kbd>. A new playlist asks for a file name first (`.m3u` is added if you
+leave it off), and saving over a different existing file asks for a second
+<kbd>Enter</kbd>. Quitting, or opening another playlist, with unsaved changes
+asks for a second <kbd>q</kbd> or <kbd>Enter</kbd>.
+
+As with the favourites, playing an item makes the playlist the queue: the
+**next** and **repeat** modes step through it, the player bar shows `List 3/12`,
+and <kbd>Enter</kbd> on a file in the MIDI panel hands the queue back to the
+directory. Items that cannot play are skipped rather than dropped, whether their
+files have gone (marked `!`) or they are unpinned and you have not chosen a font
+yet.
+
+#### Playlist file format
+
+The format is extended M3U, so a plain list of MIDI paths from any other tool
+opens as it is, and other players read voxfont's playlists and ignore its
+additions.
+
+```m3u
+#EXTM3U
+#PLAYLIST:Evening A/B
+
+# Canyon through two fonts, then two tunes through your font.
+#VOXFONT:sf=/srv/sf2/CT8MGM.SF2
+~/midi/CANYON.MID
+#VOXFONT:sf=RolandSC55.sf2
+~/midi/CANYON.MID
+classics/bwv1041.mid
+/home/me/midi/songs.zip/pop/popcorn.mid
+```
+
+- **Encoding.** UTF-8, with or without a byte-order mark. Lines end in LF or
+  CRLF. Leading and trailing whitespace on a line is ignored. The extension is
+  `.m3u` or `.m3u8`.
+- **Header.** `#EXTM3U` is optional when reading; voxfont always writes it.
+- **Items.** Every line that is not blank and does not start with `#` is the
+  path of one MIDI track (`.mid`, `.midi`, `.kar`, `.rmi`). The file order is
+  the play order. The same track may appear any number of times.
+- **Pinned items.** `#VOXFONT:sf=<path>` pins a SoundFont (`.sf2`, `.sf3`) to
+  the *next* item, and only that one. Blank lines and comments may come
+  between the directive and its track. Every item that is pinned carries its
+  own directive; there is no setting that carries on to the items after it.
+- **Unpinned items.** A track with no directive before it plays through your
+  font.
+- **Paths.** A path may be absolute, start with `~/` (your home directory), or
+  be relative, in which case it is relative to the directory the playlist file
+  is in. The same rules apply to the path in `#VOXFONT:sf=`.
+- **Files inside zip archives.** Write the path through the archive as if it
+  were a directory: `songs.zip/pop/popcorn.mid`. The first component that is an
+  existing *file* ending in `.zip` is the archive, and the rest is the member
+  inside it. A real directory named `something.zip` stays a directory.
+- **Title.** `#PLAYLIST:<title>` names the list in the overlay. Without it, the
+  file name is shown.
+- **Other lines.** Comments, `#EXTINF` and any other directive voxfont does not
+  know are ignored for playback but kept: each stays with the item that follows
+  it and moves with that item when you reorder, and comments at the top of the
+  file that are followed by a blank line stay at the top. All of them are
+  written back when you save.
+- **Lines that are not acted on.** A track that is not a MIDI file, a
+  `#VOXFONT:sf=` whose path is not a SoundFont, and a `#VOXFONT:sf=` with no
+  track after it (because another directive or the end of the file comes
+  first) do not stop the file loading. The status line reports how many there
+  were, e.g. `2 lines ignored`, and they are kept in the file as written.
+- **Missing files.** An item whose track or SoundFont does not exist is still
+  loaded, marked `!`, and skipped when playing.
+
+When voxfont saves a playlist, paths inside the playlist's directory tree are
+written relative to it, so the directory can be moved as a whole; everything
+else is written as an absolute path. A path to a file inside an archive is
+written through the archive, and each pinned item gets its own directive line.
+The last open playlist is remembered in `state.conf` (see
+[Saved session](#saved-session)).
+
 Force a specific audio backend if the default doesn't produce sound:
 
 ```sh
@@ -219,6 +350,8 @@ voxfont --selftest /path/to/font.sf2 /path/to/song.mid
 | `R` | playing history (`Enter` replays the track with its SoundFont) |
 | `f` | star the track + SoundFont being heard as a favourite |
 | `F` | favourites (`Enter` plays the starred list from there on) |
+| `P` | playlist (`Enter` plays it from there on, `w` saves) |
+| `a` / `A` | add the MIDI file under the cursor to the playlist (`A`: pinned to the loaded SoundFont) |
 | `H` | toggle hidden files · `Ctrl`+`r` reload panel |
 | `/` or `g` | incremental search in the active panel |
 | `h` / `?` | help · `q` / `Q` quit |
@@ -234,8 +367,9 @@ what happens when a track ends:
 | on | off | play through the directory, then stop |
 | on | on | loop the whole directory |
 
-When playback was started from the favourites (<kbd>F</kbd> → <kbd>Enter</kbd>),
-"the directory" in that table becomes the starred list.
+When playback was started from the favourites (<kbd>F</kbd> → <kbd>Enter</kbd>)
+or the playlist (<kbd>P</kbd> → <kbd>Enter</kbd>), "the directory" in that table
+becomes that list.
 
 ## License
 

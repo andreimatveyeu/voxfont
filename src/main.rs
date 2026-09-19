@@ -4,6 +4,7 @@ mod favourites;
 mod fluid;
 mod history;
 mod midi;
+mod playlist;
 mod state;
 mod ui;
 mod vfs;
@@ -23,20 +24,23 @@ const USAGE: &str = "\
 voxfont — console MIDI/SoundFont player
 
 Usage:
-    voxfont [-R <driver>] [--no-history] [MIDI_DIR [SOUNDFONT_DIR]]
+    voxfont [-R <driver>] [--no-history] [-p <playlist>] [MIDI_DIR [SOUNDFONT_DIR]]
     voxfont --selftest <soundfont.sf2> <file.mid>
     voxfont -h | --help
 
 Options:
     -R, --driver <driver>   Audio backend: jack (default) or alsa.
         --no-history        Don't read or write the playing history this run.
+    -p, --playlist <file>   Open this playlist (.m3u) in the playlist overlay.
+                            It is shown, not played: press Enter to start.
 
 Positional arguments (both optional):
     MIDI_DIR                Starting directory for the MIDI panel.
     SOUNDFONT_DIR           Starting directory for the SoundFont panel.
 
 When a directory is omitted, the one remembered from the previous session is
-used, falling back to $HOME.";
+used, falling back to $HOME. Without -p, the playlist open at the end of the
+previous session is reopened.";
 
 /// Parsed command line. `driver` is `None` unless `-R` was given.
 struct Cli {
@@ -45,14 +49,18 @@ struct Cli {
     sf2_dir: Option<String>,
     /// `--no-history`: keep the session's plays out of the history file.
     no_history: bool,
+    /// `-p/--playlist`: a playlist file to open at launch.
+    playlist: Option<String>,
 }
 
 /// Hand-rolled parser (no external dependency, matching the project's lean
-/// dependency policy). `-R/--driver` takes jack|alsa; up to two positionals are
-/// the MIDI and SoundFont directories. Returns `Err(message)` on misuse.
+/// dependency policy). `-R/--driver` takes jack|alsa; `-p/--playlist` takes a
+/// file; up to two positionals are the MIDI and SoundFont directories. Returns
+/// `Err(message)` on misuse.
 fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut driver = None;
     let mut no_history = false;
+    let mut playlist = None;
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -85,6 +93,21 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 no_history = true;
                 i += 1;
             }
+            "-p" | "--playlist" => {
+                let val = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{arg} requires a playlist file"))?;
+                playlist = Some(val.clone());
+                i += 2;
+            }
+            _ if arg.starts_with("-p=") || arg.starts_with("--playlist=") => {
+                let val = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
+                if val.is_empty() {
+                    return Err(format!("{arg} requires a playlist file"));
+                }
+                playlist = Some(val.to_string());
+                i += 1;
+            }
             "--" => {
                 positional.extend(args[i + 1..].iter().cloned());
                 break;
@@ -109,6 +132,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         midi_dir: it.next(),
         sf2_dir: it.next(),
         no_history,
+        playlist,
     })
 }
 
@@ -192,6 +216,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.message = Some(warnings.join("; "));
     }
 
+    // The session file is written only by the real app, never by tests.
+    app.persist_session = true;
+
     // Load the playing history. `App` starts with an in-memory one that is never
     // written, so `--no-history` (and every test) simply leaves it in place.
     if !cli.no_history {
@@ -212,6 +239,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(sf) = saved.soundfont.filter(|l| l.exists()) {
         app.sf2.select_deep(&sf);
         app.restore_soundfont(sf);
+    }
+
+    // Open the playlist: the one named on the command line, shown in its
+    // overlay, or else the one open last session, quietly. Neither plays.
+    match &cli.playlist {
+        Some(p) => match app.load_playlist(std::path::Path::new(p)) {
+            Ok(()) => {
+                let msg = app.message.take();
+                app.playlist_open();
+                app.message = app.message.take().or(msg);
+            }
+            Err(e) => {
+                app.message = Some(match app.message.take() {
+                    Some(m) => format!("{e}; {m}"),
+                    None => e,
+                })
+            }
+        },
+        None => {
+            if let Some(p) = saved.playlist.filter(|p| p.is_file()) {
+                let banner = app.message.take();
+                // A file that has become unreadable is simply not reopened.
+                let _ = app.load_playlist(&p);
+                app.message = banner;
+            }
+        }
     }
 
     // Restore the terminal even if we panic.
@@ -333,15 +386,28 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // History / favourites overlay.
-    if app.overlay.is_some() {
-        handle_overlay_key(app, key);
+    // A pending "discard unsaved playlist changes?" question stands only while
+    // the key that asked it (q to quit, Enter to open) is pressed again.
+    let confirming = matches!(
+        key.code,
+        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Enter
+    ) && app.overlay.is_none()
+        && app.prompt.is_none()
+        && app.search.is_none();
+    if !confirming {
+        app.disarm_discard();
+    }
+
+    // The path prompt. It comes first because saving a playlist opens it from
+    // inside the overlay.
+    if app.prompt.is_some() {
+        handle_prompt_key(app, key);
         return;
     }
 
-    // "Go to directory" prompt.
-    if app.goto.is_some() {
-        handle_goto_key(app, key);
+    // History / favourites / playlist overlay.
+    if app.overlay.is_some() {
+        handle_overlay_key(app, key);
         return;
     }
 
@@ -355,7 +421,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Char('Q') => app.quit = true,
+        KeyCode::Char('q') | KeyCode::Char('Q') => app.request_quit(),
 
         KeyCode::Tab | KeyCode::BackTab => app.toggle_panel(),
 
@@ -375,6 +441,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('R') => app.history_open(),
         KeyCode::Char('F') => app.favourites_open(),
         KeyCode::Char('f') => app.toggle_favourite(),
+        // The playlist: open it, or add the track under the cursor to it.
+        KeyCode::Char('P') => app.playlist_open(),
+        KeyCode::Char('a') => app.playlist_add(false),
+        KeyCode::Char('A') => app.playlist_add(true),
 
         KeyCode::Char('p') | KeyCode::Char(' ') => app.toggle_pause(),
         KeyCode::Char('s') => app.stop(),
@@ -406,9 +476,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Keys while the history or favourites overlay is open. `Enter` plays the
-/// selected row with its SoundFont; the overlay otherwise navigates like a
-/// panel. `R` and `F` switch between the two stores, or close the one showing.
+/// Keys while the history, favourites or playlist overlay is open. `Enter`
+/// plays the selected row with its SoundFont; the overlay otherwise navigates
+/// like a panel. `R`, `F` and `P` switch between the stores, or close the one
+/// showing.
 fn handle_overlay_key(app: &mut App, key: KeyEvent) {
     // `/` filter mode captures printable keys; cursor keys still move.
     if app.overlay_filtering() {
@@ -437,13 +508,22 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             Some(Source::Favourites) => app.overlay_close(),
             _ => app.favourites_open(),
         },
+        KeyCode::Char('P') => match app.overlay_source() {
+            Some(Source::Playlist) => app.overlay_close(),
+            _ => app.playlist_open(),
+        },
+        // Playlist editing; each is a no-op in the other overlays.
+        KeyCode::Char('s') => app.overlay_set_font(true),
+        KeyCode::Char('x') => app.overlay_set_font(false),
+        KeyCode::Char('w') => app.overlay_save(false),
+        KeyCode::Char('W') => app.overlay_save(true),
         KeyCode::Enter => app.overlay_activate(),
         KeyCode::Tab | KeyCode::BackTab => app.overlay_cycle_view(),
         KeyCode::Char('G') => app.overlay_reveal(),
         KeyCode::Char('d') => app.overlay_delete(),
         KeyCode::Char('f') => app.overlay_toggle_favourite(),
         KeyCode::Char('D') => app.history_clear(),
-        // Reorder the playlist. Shift+arrows are handled in the movement
+        // Reorder the list. Shift+arrows are handled in the movement
         // helper, so they work while the filter is capturing keys too; J/K are
         // there for terminals that swallow shifted arrows.
         KeyCode::Char('J') => app.overlay_move(true),
@@ -455,7 +535,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
 
 /// Cursor movement inside the overlay, shared by both its modes.
 fn overlay_move_key(app: &mut App, key: KeyEvent) {
-    // Shifted arrows move the selected favourite, not the cursor.
+    // Shifted arrows move the selected favourite or item, not the cursor.
     if key.modifiers.contains(KeyModifiers::SHIFT) {
         match key.code {
             KeyCode::Up => return app.overlay_move(false),
@@ -478,18 +558,18 @@ fn overlay_move_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_goto_key(app: &mut App, key: KeyEvent) {
+fn handle_prompt_key(app: &mut App, key: KeyEvent) {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Esc => app.goto_cancel(),
-        KeyCode::Enter => app.goto_submit(),
-        KeyCode::Tab => app.goto_complete(),
+        KeyCode::Esc => app.prompt_cancel(),
+        KeyCode::Enter => app.prompt_submit(),
+        KeyCode::Tab => app.prompt_complete(),
         // Alt+Backspace / Ctrl+W: delete the previous path component.
-        KeyCode::Backspace if alt => app.goto_delete_component(),
-        KeyCode::Char('w') if ctrl => app.goto_delete_component(),
-        KeyCode::Backspace => app.goto_backspace(),
-        KeyCode::Char(c) => app.goto_push(c),
+        KeyCode::Backspace if alt => app.prompt_delete_component(),
+        KeyCode::Char('w') if ctrl => app.prompt_delete_component(),
+        KeyCode::Backspace => app.prompt_backspace(),
+        KeyCode::Char(c) => app.prompt_push(c),
         _ => {}
     }
 }
@@ -557,6 +637,18 @@ mod tests {
         assert!(c.no_history);
         assert_eq!(c.midi_dir.as_deref(), Some("/midi"));
         assert!(!parse_args(&s(&["/midi"])).unwrap().no_history);
+    }
+
+    #[test]
+    fn parses_playlist_option_in_both_forms() {
+        let c = parse_args(&s(&["-p", "list.m3u", "/midi"])).unwrap();
+        assert_eq!(c.playlist.as_deref(), Some("list.m3u"));
+        assert_eq!(c.midi_dir.as_deref(), Some("/midi"));
+        let c = parse_args(&s(&["--playlist=/l/a.m3u"])).unwrap();
+        assert_eq!(c.playlist.as_deref(), Some("/l/a.m3u"));
+        assert!(parse_args(&s(&[])).unwrap().playlist.is_none());
+        assert!(parse_args(&s(&["-p"])).is_err());
+        assert!(parse_args(&s(&["--playlist="])).is_err());
     }
 
     #[test]

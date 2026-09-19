@@ -6,6 +6,7 @@ use crate::favourites::Favourites;
 use crate::fluid::Synth;
 use crate::history::{self, History, Row, View};
 use crate::midi::{self, MidiInfo};
+use crate::playlist::{self, Playlist};
 use crate::vfs::{self, Location};
 use ratatui::widgets::ListState;
 use rustyline::completion::{longest_common_prefix, Candidate, FilenameCompleter};
@@ -47,20 +48,21 @@ struct Pending {
     count: bool,
 }
 
-/// Which store the overlay is showing. Both are lists of (track, SoundFont)
+/// Which store the overlay is showing. All are lists of (track, SoundFont)
 /// rows over the same layout and keys, so they share one overlay rather than
 /// each growing their own copy of the navigation, filter and reveal logic.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Source {
     History,
     Favourites,
+    Playlist,
 }
 
 /// Where the *next* track comes from when the current one finishes. Set by
 /// whatever started playing: browsing plays on through the directory, a
-/// favourite plays on through the favourites list. There is deliberately no
-/// separate "playlist mode" to toggle — as with directory playback, where you
-/// started decides what follows.
+/// favourite plays on through the favourites list, a playlist item through the
+/// playlist. There is deliberately no separate "playlist mode" to toggle — as
+/// with directory playback, where you started decides what follows.
 #[derive(Clone)]
 enum PlaySource {
     Directory,
@@ -71,6 +73,21 @@ enum PlaySource {
         key: (Location, Location),
         idx: usize,
     },
+    /// Playing the open playlist. A playlist may hold the same pair twice, so
+    /// the playing item is followed by its session identity rather than by
+    /// its contents; `idx` is the fallback if it is removed while it plays.
+    Playlist {
+        id: u64,
+        idx: usize,
+    },
+}
+
+/// Which list a [`Step`] came from, and where in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Origin {
+    Directory,
+    Favourite(usize),
+    Playlist { id: u64, idx: usize },
 }
 
 /// The next thing to play, as resolved from the current [`PlaySource`].
@@ -78,8 +95,33 @@ struct Step {
     midi: Location,
     /// The SoundFont it must be heard through; `None` keeps the loaded one.
     soundfont: Option<Location>,
-    /// Its index in the favourites list, when it came from there.
-    fav_idx: Option<usize>,
+    origin: Origin,
+}
+
+/// What the bottom-line prompt is asking for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PromptKind {
+    /// A directory for the active panel (the `i` key).
+    Goto,
+    /// A file to save the playlist to (`W`, or `w` on a new playlist).
+    SavePlaylist,
+}
+
+/// The one-line path prompt, with filename completion.
+pub struct Prompt {
+    pub kind: PromptKind,
+    pub buf: String,
+    /// Set when saving would overwrite a different, existing file; a second
+    /// Enter on the same path goes ahead. Any edit takes it back.
+    confirm: Option<PathBuf>,
+}
+
+/// An action held back because it would drop unsaved playlist edits, waiting
+/// for the same key again to confirm it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Discard {
+    Quit,
+    Open(PathBuf),
 }
 
 /// State of the history / favourites overlay while it is open.
@@ -152,10 +194,25 @@ pub struct App {
     /// What has been played, and through which SoundFont. Starts in-memory
     /// only; `main` swaps in the persisted one unless `--no-history` was given.
     pub history: History,
-    /// The starred (track, SoundFont) pairs, which double as the playlist.
+    /// The starred (track, SoundFont) pairs, which double as a playlist.
     /// Starts in-memory only; `main` swaps in the persisted one. `--no-history`
     /// does not affect it: a star is a deliberate act, not a recording.
     pub favs: Favourites,
+    /// The open playlist file — or a new, unsaved one. Saved only on request.
+    pub playlist: Playlist,
+    /// The SoundFont a playlist item without one of its own plays through: the
+    /// font last chosen, by hand or by replaying a history entry or favourite,
+    /// or restored from the session. Fonts that playlist and favourites items
+    /// load for themselves do not change it, so after an item pinned to one
+    /// font, the next unpinned item goes back to the user's choice.
+    pub user_font: Option<Location>,
+    /// A quit or playlist switch waiting for confirmation because the playlist
+    /// has unsaved changes.
+    discard_armed: Option<Discard>,
+    /// Whether [`Self::save_state`] writes the session file. Off by default,
+    /// like the in-memory history and favourites, so tests never overwrite the
+    /// real `state.conf`; `main` turns it on.
+    pub persist_session: bool,
     /// The combination being listened to right now, not yet committed.
     pending: Option<Pending>,
     /// Open history / favourites overlay, if any.
@@ -177,8 +234,8 @@ pub struct App {
     pub message: Option<String>,
     /// Active incremental-search query for the focused panel, if in search mode.
     pub search: Option<String>,
-    /// Active "go to directory" input buffer, if in goto mode.
-    pub goto: Option<String>,
+    /// The open path prompt (go to directory, save playlist), if any.
+    pub prompt: Option<Prompt>,
     pub show_help: bool,
     pub quit: bool,
 
@@ -197,7 +254,8 @@ impl App {
         Ok(App {
             // Only the MIDI panel browses into archives; SoundFonts come from
             // the filesystem only.
-            midi: Browser::new_at(midi_dir, MIDI_EXTS, true, true),
+            midi: Browser::new_at(midi_dir, MIDI_EXTS, true, true)
+                .also_listing(playlist::PLAYLIST_EXTS),
             sf2: Browser::new_at(sf2_dir, SF2_EXTS, false, false),
             active: Panel::Midi,
             synth,
@@ -208,6 +266,10 @@ impl App {
             cur_info: None,
             history: History::default(),
             favs: Favourites::default(),
+            playlist: Playlist::default(),
+            user_font: None,
+            discard_armed: None,
+            persist_session: false,
             pending: None,
             overlay: None,
             play_source: PlaySource::Directory,
@@ -218,7 +280,7 @@ impl App {
             next_mode: true,
             message: warn,
             search: None,
-            goto: None,
+            prompt: None,
             show_help: false,
             quit: false,
             play_started: None,
@@ -274,9 +336,17 @@ impl App {
             Some(e) => e.loc.clone(),
             None => return,
         };
+        if self.active == Panel::Midi && playlist::is_playlist_name(&loc.file_name()) {
+            if let Some(p) = loc.as_fs() {
+                self.open_playlist(p.to_path_buf());
+            }
+            return;
+        }
+        self.discard_armed = None;
         match self.active {
             // Loading a font by hand is the A/B move; it does not leave the
-            // favourites playlist, whose next entry brings its own font.
+            // favourites or the playlist, whose next entry brings its own font
+            // (or, in a playlist, plays through this one).
             Panel::Sf2 => self.load_soundfont(loc),
             // Playing from the panel hands the queue back to the directory.
             Panel::Midi => {
@@ -323,26 +393,33 @@ impl App {
         self.active_browser().set_filter("");
     }
 
+    /// Load a SoundFont the user chose. It becomes the user's font.
     pub fn load_soundfont(&mut self, loc: Location) {
-        self.load_font(loc, true);
+        if self.load_font(loc.clone(), true) {
+            self.user_font = Some(loc);
+        }
     }
 
     /// Load the SoundFont remembered from the last session without writing a
     /// history entry: the user did not pick it this time, and an automatic
-    /// restore must not push it to the top of the history on every launch.
+    /// restore must not push it to the top of the history on every launch. It
+    /// is still the user's font.
     pub fn restore_soundfont(&mut self, loc: Location) {
-        self.load_font(loc, false);
+        if self.load_font(loc.clone(), false) {
+            self.user_font = Some(loc);
+        }
     }
 
     /// Load `loc` into the synth, remembering the combination when `remember`.
-    fn load_font(&mut self, loc: Location, remember: bool) {
+    /// Returns true when the font loaded.
+    fn load_font(&mut self, loc: Location, remember: bool) -> bool {
         // Archive members are extracted to a temp file first, since the FFI
         // loads SoundFonts by filename only.
         let (path, guard) = match vfs::resolve_to_file(&loc) {
             Ok(r) => r,
             Err(e) => {
                 self.message = Some(e);
-                return;
+                return false;
             }
         };
         match self.synth.load_soundfont(&path) {
@@ -373,8 +450,12 @@ impl App {
                 self.sf_temp = guard;
                 self.message = Some(format!("SoundFont loaded: {name}"));
                 self.save_state();
+                true
             }
-            Err(e) => self.message = Some(e),
+            Err(e) => {
+                self.message = Some(e);
+                false
+            }
         }
     }
 
@@ -382,11 +463,15 @@ impl App {
     /// SoundFont for next launch. Directories and the played file keep their full
     /// location, so an archive (or a file inside one) is restored as such.
     pub fn save_state(&self) {
+        if !self.persist_session {
+            return;
+        }
         crate::state::save(&crate::state::State {
             midi_dir: Some(self.midi.location()),
             midi_file: self.last_played.clone(),
             sf2_dir: Some(self.sf2.location()),
             soundfont: self.soundfont.clone(),
+            playlist: self.playlist.path().cloned(),
         });
     }
 
@@ -529,8 +614,8 @@ impl App {
     /// | on   | on     | play next; wrap to the first           |
     ///
     /// "Next" means the next file in the playing file's directory, or the next
-    /// starred pair when the favourites started this track — see
-    /// [`PlaySource`]. The table itself is the same either way.
+    /// entry of the favourites or the playlist when one of those started this
+    /// track — see [`PlaySource`]. The table itself is the same either way.
     pub fn tick(&mut self) {
         // A combination becomes history as soon as it has been heard long
         // enough, rather than at the end of the track, so it survives a crash
@@ -581,10 +666,11 @@ impl App {
                 next.map(|midi| Step {
                     midi,
                     soundfont: None,
-                    fav_idx: None,
+                    origin: Origin::Directory,
                 })
             }
             PlaySource::Favourites { key, idx } => self.next_favourite(&key, idx),
+            PlaySource::Playlist { id, idx } => self.next_playlist_item(id, idx),
         }
     }
 
@@ -616,28 +702,79 @@ impl App {
                 return Some(Step {
                     midi: fav.midi.clone(),
                     soundfont: Some(fav.soundfont.clone()),
-                    fav_idx: Some(i),
+                    origin: Origin::Favourite(i),
                 });
             }
         }
         None
     }
 
+    /// Walk forward through the playlist from the item that just played,
+    /// skipping any that cannot be played now, with the same one-pass cap and
+    /// reorder-following as [`Self::next_favourite`].
+    fn next_playlist_item(&self, id: u64, idx: usize) -> Option<Step> {
+        let n = self.playlist.len();
+        if n == 0 {
+            return None;
+        }
+        let (at, first) = match self.playlist.position_of(id) {
+            Some(p) => (p, 1),
+            None => (idx, 0),
+        };
+        for offset in first..first + n {
+            let i = match at + offset {
+                i if i < n => i,
+                i if self.repeat => i % n,
+                _ => return None,
+            };
+            if let Some(step) = self.playlist_step(i) {
+                return Some(step);
+            }
+        }
+        None
+    }
+
+    /// The step for playlist item `i`, if it can be played now: its track is
+    /// there, and so is the font it plays through — its own, or the user's.
+    fn playlist_step(&self, i: usize) -> Option<Step> {
+        let item = self.playlist.get(i)?;
+        let font = item.soundfont.clone().or_else(|| self.user_font.clone())?;
+        if !(item.midi.exists() && font.exists()) {
+            return None;
+        }
+        Some(Step {
+            midi: item.midi.clone(),
+            soundfont: Some(font),
+            origin: Origin::Playlist {
+                id: self.playlist.id_at(i)?,
+                idx: i,
+            },
+        })
+    }
+
     /// Play what [`Self::next_in_source`] resolved, loading the step's own
     /// SoundFont first when it brought one.
     fn play_step(&mut self, step: Step) {
-        if let (Some(sf), Some(i)) = (step.soundfont.clone(), step.fav_idx) {
-            // Advancing the queue is not a choice the user made, so the font is
-            // loaded without a history record: the play itself is recorded, and
-            // a font-only row (or one pairing the finished track with the new
-            // font) would be noise.
-            if self.soundfont.as_ref() != Some(&sf) {
+        // Advancing the queue is not a choice the user made, so the font is
+        // loaded without a history record: the play itself is recorded, and a
+        // font-only row (or one pairing the finished track with the new font)
+        // would be noise. Nor does it become the user's font.
+        if let Some(sf) = &step.soundfont {
+            if self.soundfont.as_ref() != Some(sf) {
                 self.load_font(sf.clone(), false);
             }
-            self.play_source = PlaySource::Favourites {
-                key: (step.midi.clone(), sf),
-                idx: i,
-            };
+        }
+        match (step.origin, step.soundfont) {
+            (Origin::Favourite(idx), Some(sf)) => {
+                self.play_source = PlaySource::Favourites {
+                    key: (step.midi.clone(), sf),
+                    idx,
+                };
+            }
+            (Origin::Playlist { id, idx }, _) => {
+                self.play_source = PlaySource::Playlist { id, idx };
+            }
+            _ => {}
         }
         self.play_track(step.midi, true);
     }
@@ -722,7 +859,8 @@ impl App {
 
     /// Commit whatever is still pending and flush both stores — called on exit.
     /// The favourites save on every change, so this only catches a write that
-    /// failed earlier.
+    /// failed earlier. The playlist is not saved here: saving it is explicit,
+    /// and quitting with unsaved edits has already been confirmed.
     pub fn finish(&mut self) {
         self.commit_history();
         self.history.save();
@@ -801,25 +939,29 @@ impl App {
         }
     }
 
-    /// (position, length) in the favourites playlist, when it is what is
-    /// playing. `None` while the queue is the directory.
-    pub fn playlist_position(&self) -> Option<(usize, usize)> {
-        match &self.play_source {
-            PlaySource::Directory => None,
-            PlaySource::Favourites { key, idx } => {
-                // The list can be emptied, or shortened, while it is the queue.
-                let n = self.favs.len();
-                if n == 0 {
-                    return None;
-                }
-                let at = self
-                    .favs
-                    .position_of(&key.0, &key.1)
-                    .unwrap_or(*idx)
-                    .min(n - 1);
-                Some((at + 1, n))
-            }
+    /// Which list is the queue, with the (1-based position, length) of what is
+    /// playing in it. `None` while the queue is the directory.
+    pub fn queue_position(&self) -> Option<(Source, usize, usize)> {
+        // Either list can be emptied, or shortened, while it is the queue.
+        let (source, found, idx, n) = match &self.play_source {
+            PlaySource::Directory => return None,
+            PlaySource::Favourites { key, idx } => (
+                Source::Favourites,
+                self.favs.position_of(&key.0, &key.1),
+                *idx,
+                self.favs.len(),
+            ),
+            PlaySource::Playlist { id, idx } => (
+                Source::Playlist,
+                self.playlist.position_of(*id),
+                *idx,
+                self.playlist.len(),
+            ),
+        };
+        if n == 0 {
+            return None;
         }
+        Some((source, found.unwrap_or(idx).min(n - 1) + 1, n))
     }
 
     // --- the history / favourites overlay (the `R` and `F` keys) --------------
@@ -830,6 +972,10 @@ impl App {
 
     pub fn favourites_open(&mut self) {
         self.overlay_open(Source::Favourites);
+    }
+
+    pub fn playlist_open(&mut self) {
+        self.overlay_open(Source::Playlist);
     }
 
     fn overlay_open(&mut self, source: Source) {
@@ -847,6 +993,10 @@ impl App {
             Source::Favourites if self.favs.is_empty() => {
                 Some("No favourites yet — press f while a track is playing".to_string())
             }
+            Source::Playlist if self.playlist.is_empty() => Some(
+                "The playlist is empty — press a on a MIDI file to add it (A: with the loaded SoundFont)"
+                    .to_string(),
+            ),
             _ => None,
         };
         self.overlay = Some(Overlay {
@@ -864,6 +1014,9 @@ impl App {
         match source {
             Source::History => self.history.rows(view, filter),
             Source::Favourites => self.favs.rows(filter, &self.history),
+            Source::Playlist => self
+                .playlist
+                .rows(filter, &self.history, self.user_font.as_ref()),
         }
     }
 
@@ -947,7 +1100,7 @@ impl App {
 
     /// Play the selected row. From the history that means hearing the entry
     /// again exactly as it was, and the queue reverts to the directory; from
-    /// the favourites it starts the playlist at that entry.
+    /// the favourites or the playlist it starts that list at the entry.
     pub fn overlay_activate(&mut self) {
         let (source, row) = match self.overlay.as_ref() {
             Some(o) => match o.selected() {
@@ -967,7 +1120,50 @@ impl App {
                     self.play_favourite_at(idx);
                 }
             }
+            Source::Playlist => {
+                if let Some(&idx) = row.idxs.first() {
+                    self.play_playlist_at(idx);
+                }
+            }
         }
+    }
+
+    /// Start (or restart) the playlist at item `idx`. Like a favourite, an
+    /// item that cannot be played reports why and leaves everything as it was.
+    fn play_playlist_at(&mut self, idx: usize) {
+        let item = match self.playlist.get(idx) {
+            Some(i) => i.clone(),
+            None => return,
+        };
+        let font = match item.soundfont.clone().or_else(|| self.user_font.clone()) {
+            Some(f) => f,
+            None => {
+                self.message = Some(
+                    "This item has no SoundFont of its own — load one in the right panel first"
+                        .into(),
+                );
+                return;
+            }
+        };
+        if !font.exists() {
+            self.message = Some(format!("SoundFont is gone: {}", font.display()));
+            return;
+        }
+        if !item.midi.exists() {
+            self.message = Some(format!("File is gone: {}", item.midi.display()));
+            return;
+        }
+        let id = match self.playlist.id_at(idx) {
+            Some(id) => id,
+            None => return,
+        };
+        self.midi.reveal(&item.midi);
+        self.sf2.reveal(&font);
+        self.play_step(Step {
+            midi: item.midi,
+            soundfont: Some(font),
+            origin: Origin::Playlist { id, idx },
+        });
     }
 
     /// Start (or restart) the favourites playlist at `idx`.
@@ -1043,7 +1239,8 @@ impl App {
     }
 
     /// Drop the selected row: forget it from the history (in a grouped view,
-    /// every entry behind it), or take the star off a favourite.
+    /// every entry behind it), take the star off a favourite, or remove the
+    /// item from the playlist.
     pub fn overlay_delete(&mut self) {
         let (source, idxs) = match self.overlay.as_ref() {
             Some(o) => match o.selected() {
@@ -1063,11 +1260,17 @@ impl App {
                     self.favs.save();
                 }
             }
+            Source::Playlist => {
+                if let Some(&i) = idxs.first() {
+                    self.playlist.remove(i);
+                }
+            }
         }
         self.overlay_rebuild(true);
     }
 
-    /// `f` inside an overlay: star the selected history row, or un-star the
+    /// `f` inside an overlay: star the selected history row or playlist item
+    /// (a playlist item through the font it plays through), or un-star the
     /// selected favourite (where it is the same gesture as `d`).
     pub fn overlay_toggle_favourite(&mut self) {
         let (source, row) = match self.overlay.as_ref() {
@@ -1081,7 +1284,11 @@ impl App {
             self.overlay_delete();
             return;
         }
-        match (row.midi, row.soundfont) {
+        let soundfont = match source {
+            Source::Playlist => row.soundfont.or_else(|| self.user_font.clone()),
+            _ => row.soundfont,
+        };
+        match (row.midi, soundfont) {
             (Some(m), Some(sf)) => {
                 self.star(m, sf);
                 self.overlay_rebuild(true);
@@ -1094,13 +1301,13 @@ impl App {
         }
     }
 
-    /// Move the selected favourite one place along the playlist, the cursor
-    /// following it. Under a filter the row swaps with its visible neighbour,
-    /// so the move is always the one on screen.
+    /// Move the selected favourite or playlist item one place along its list,
+    /// the cursor following it. Under a filter the row swaps with its visible
+    /// neighbour, so the move is always the one on screen.
     pub fn overlay_move(&mut self, down: bool) {
-        let (i, rows) = match self.overlay.as_ref() {
-            Some(o) if o.source == Source::Favourites => {
-                (o.state.selected().unwrap_or(0), o.rows.clone())
+        let (source, i, rows) = match self.overlay.as_ref() {
+            Some(o) if o.source != Source::History => {
+                (o.source, o.state.selected().unwrap_or(0), o.rows.clone())
             }
             _ => return,
         };
@@ -1115,8 +1322,12 @@ impl App {
             (Some(a), Some(b)) => (a.idxs[0], b.idxs[0]),
             _ => return,
         };
-        self.favs.swap(a, b);
-        self.favs.save();
+        if source == Source::Playlist {
+            self.playlist.swap(a, b);
+        } else {
+            self.favs.swap(a, b);
+            self.favs.save();
+        }
         self.overlay_rebuild(true);
         if let Some(o) = self.overlay.as_mut() {
             o.state.select(Some(j.min(o.rows.len().saturating_sub(1))));
@@ -1161,7 +1372,201 @@ impl App {
         }
     }
 
-    // --- "go to directory" prompt (the `i` key) --------------------------------
+    // --- the playlist (the `P`, `a` and `A` keys) ------------------------------
+
+    /// Read the playlist at `path` into the app, replacing the open one. Used
+    /// at launch; [`Self::open_playlist`] is the interactive route, which
+    /// guards unsaved edits first.
+    pub fn load_playlist(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let (list, ignored) = Playlist::load(path)?;
+        let n = list.len();
+        let mut msg = format!(
+            "Playlist: {} · {n} item{}",
+            list.name(),
+            if n == 1 { "" } else { "s" }
+        );
+        if ignored > 0 {
+            msg.push_str(&format!(
+                " · {ignored} line{} ignored",
+                if ignored == 1 { "" } else { "s" }
+            ));
+        }
+        self.playlist = list;
+        // The queue's item identities belonged to the list just replaced.
+        if matches!(self.play_source, PlaySource::Playlist { .. }) {
+            self.play_source = PlaySource::Directory;
+        }
+        self.message = Some(msg);
+        Ok(())
+    }
+
+    /// Open a playlist file from the MIDI panel into the overlay, without
+    /// playing it. Unsaved edits to the open playlist are only dropped when
+    /// the same file is opened a second time in a row.
+    pub fn open_playlist(&mut self, path: PathBuf) {
+        let path = playlist::absolute(&path);
+        let armed = Some(Discard::Open(path.clone()));
+        if self.playlist.is_dirty() && self.discard_armed != armed {
+            self.discard_armed = armed;
+            self.message = Some(format!(
+                "The playlist has unsaved changes — Enter again to discard them and open {}",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ));
+            return;
+        }
+        self.discard_armed = None;
+        match self.load_playlist(&path) {
+            Ok(()) => {
+                // Keep the message the overlay would replace with its own.
+                let msg = self.message.take();
+                self.playlist_open();
+                self.message = self.message.take().or(msg);
+                self.save_state();
+            }
+            Err(e) => self.message = Some(e),
+        }
+    }
+
+    /// Quit, unless that would lose playlist edits: then the first `q` only
+    /// warns, and a second one in a row quits.
+    pub fn request_quit(&mut self) {
+        if self.playlist.is_dirty() && self.discard_armed != Some(Discard::Quit) {
+            self.discard_armed = Some(Discard::Quit);
+            self.message = Some(
+                "The playlist has unsaved changes — q again to quit without saving (P, then w saves)"
+                    .into(),
+            );
+            return;
+        }
+        self.quit = true;
+    }
+
+    /// Take back a pending "discard unsaved changes?" question.
+    pub fn disarm_discard(&mut self) {
+        if self.discard_armed.take().is_some() {
+            self.message = None;
+        }
+    }
+
+    /// Append the MIDI file under the cursor to the playlist, without a
+    /// SoundFont of its own or (`with_font`) pinned to the loaded one. The
+    /// cursor moves on, so a run of tracks is added by pressing the key again.
+    pub fn playlist_add(&mut self, with_font: bool) {
+        let entry = match (self.active, self.midi.selected()) {
+            (Panel::Midi, Some(e)) if !e.is_dir && !playlist::is_playlist_name(&e.name) => {
+                e.clone()
+            }
+            _ => {
+                self.message =
+                    Some("Put the cursor on a MIDI file in the left panel to add it".into());
+                return;
+            }
+        };
+        let font = match (with_font, self.soundfont.clone()) {
+            (false, _) => None,
+            (true, Some(sf)) => Some(sf),
+            (true, None) => {
+                self.message =
+                    Some("No SoundFont loaded — A adds the track with the loaded SoundFont".into());
+                return;
+            }
+        };
+        self.message = Some(match &font {
+            Some(sf) => format!(
+                "Added to the playlist ({}): {} + {}",
+                self.playlist.len() + 1,
+                entry.name,
+                sf.file_name()
+            ),
+            None => format!(
+                "Added to the playlist ({}): {}",
+                self.playlist.len() + 1,
+                entry.name
+            ),
+        });
+        self.playlist.push(entry.loc, font);
+        self.midi.move_down(1);
+    }
+
+    /// `s` / `x` in the playlist overlay: pin the loaded SoundFont to the
+    /// selected item, or (`pin` false) unpin it so it plays through the user's
+    /// font.
+    pub fn overlay_set_font(&mut self, pin: bool) {
+        let idx = match self.overlay.as_ref() {
+            Some(o) if o.source == Source::Playlist => match o.selected() {
+                Some(r) => r.idxs[0],
+                None => return,
+            },
+            _ => return,
+        };
+        let font = match (pin, self.soundfont.clone()) {
+            (false, _) => None,
+            (true, Some(sf)) => Some(sf),
+            (true, None) => {
+                self.message = Some("No SoundFont loaded to pin to the item".into());
+                return;
+            }
+        };
+        self.playlist.set_font(idx, font);
+        self.overlay_rebuild(true);
+    }
+
+    /// `w` / `W` in the playlist overlay: save to the playlist's own file, or
+    /// ask for one (always, for `W`; for `w`, when the list is new).
+    pub fn overlay_save(&mut self, save_as: bool) {
+        if self.overlay_source() != Some(Source::Playlist) {
+            return;
+        }
+        if save_as || self.playlist.path().is_none() {
+            let buf = match self.playlist.path() {
+                Some(p) => p.to_string_lossy().into_owned(),
+                None => self
+                    .midi
+                    .fs_dir()
+                    .join("playlist.m3u")
+                    .to_string_lossy()
+                    .into_owned(),
+            };
+            self.prompt = Some(Prompt {
+                kind: PromptKind::SavePlaylist,
+                buf,
+                confirm: None,
+            });
+            return;
+        }
+        self.save_playlist_as(None);
+    }
+
+    /// Save the playlist to `path`, or to its own file with `None`.
+    fn save_playlist_as(&mut self, path: Option<PathBuf>) -> bool {
+        let res = match path {
+            Some(p) => self.playlist.save_as(p),
+            None => self.playlist.save(),
+        };
+        match res {
+            Ok(()) => {
+                let n = self.playlist.len();
+                self.message = Some(format!(
+                    "Saved {} ({n} item{})",
+                    self.playlist
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    if n == 1 { "" } else { "s" }
+                ));
+                self.save_state();
+                true
+            }
+            Err(e) => {
+                self.message = Some(e);
+                false
+            }
+        }
+    }
+
+    // --- the path prompt (`i`, and saving a playlist) ---------------------------
 
     /// Open the GO prompt, pre-filled with the active panel's directory. The
     /// prompt navigates the filesystem only, so an archive resolves to the
@@ -1171,37 +1576,45 @@ impl App {
         if !d.ends_with('/') {
             d.push('/');
         }
-        self.goto = Some(d);
+        self.prompt = Some(Prompt {
+            kind: PromptKind::Goto,
+            buf: d,
+            confirm: None,
+        });
     }
 
-    pub fn goto_push(&mut self, c: char) {
-        if let Some(g) = self.goto.as_mut() {
-            g.push(c);
+    /// Change the prompt's text. Any edit takes back an overwrite question.
+    fn prompt_edit(&mut self, f: impl FnOnce(&mut String)) {
+        if let Some(p) = self.prompt.as_mut() {
+            f(&mut p.buf);
+            p.confirm = None;
         }
     }
 
-    pub fn goto_backspace(&mut self) {
-        if let Some(g) = self.goto.as_mut() {
-            g.pop();
-        }
+    pub fn prompt_push(&mut self, c: char) {
+        self.prompt_edit(|b| b.push(c));
+    }
+
+    pub fn prompt_backspace(&mut self) {
+        self.prompt_edit(|b| {
+            b.pop();
+        });
     }
 
     /// Delete the last path component (back to the previous slash).
-    pub fn goto_delete_component(&mut self) {
-        if let Some(g) = self.goto.as_mut() {
-            *g = delete_path_component(g);
-        }
+    pub fn prompt_delete_component(&mut self) {
+        self.prompt_edit(|b| *b = delete_path_component(b));
     }
 
-    pub fn goto_cancel(&mut self) {
-        self.goto = None;
+    pub fn prompt_cancel(&mut self) {
+        self.prompt = None;
     }
 
-    /// Tab-complete the path in the GO buffer using rustyline's filesystem
+    /// Tab-complete the path in the prompt using rustyline's filesystem
     /// completer (handles the directory scan, matching and common-prefix logic).
-    pub fn goto_complete(&mut self) {
-        let input = match self.goto.clone() {
-            Some(i) => i,
+    pub fn prompt_complete(&mut self) {
+        let input = match self.prompt.as_ref() {
+            Some(p) => p.buf.clone(),
             None => return,
         };
         let completer = FilenameCompleter::new();
@@ -1212,33 +1625,70 @@ impl App {
         match candidates.len() {
             0 => {}
             1 => {
-                self.goto = Some(format!(
-                    "{}{}",
-                    &input[..start],
-                    candidates[0].replacement()
-                ));
+                let done = format!("{}{}", &input[..start], candidates[0].replacement());
+                self.prompt_edit(|b| *b = done);
             }
             n => {
                 if let Some(lcp) = longest_common_prefix(&candidates) {
-                    self.goto = Some(format!("{}{}", &input[..start], lcp));
+                    let done = format!("{}{}", &input[..start], lcp);
+                    self.prompt_edit(|b| *b = done);
                 }
                 self.message = Some(format!("{n} matches"));
             }
         }
     }
 
-    /// Navigate the active panel to the entered directory.
-    pub fn goto_submit(&mut self) {
-        let input = match self.goto.take() {
-            Some(i) => i,
+    /// Act on the prompt: navigate the active panel, or save the playlist.
+    pub fn prompt_submit(&mut self) {
+        let (kind, input, confirm) = match self.prompt.as_ref() {
+            Some(p) => (p.kind, p.buf.trim().to_string(), p.confirm.clone()),
             None => return,
         };
-        let path = PathBuf::from(expand_tilde(input.trim()));
-        if path.is_dir() {
-            self.message = None;
-            self.active_browser().set_dir(path);
-        } else {
-            self.message = Some(format!("Not a directory: {}", input.trim()));
+        match kind {
+            PromptKind::Goto => {
+                self.prompt = None;
+                let path = PathBuf::from(expand_tilde(&input));
+                if path.is_dir() {
+                    self.message = None;
+                    self.active_browser().set_dir(path);
+                } else {
+                    self.message = Some(format!("Not a directory: {input}"));
+                }
+            }
+            PromptKind::SavePlaylist => {
+                if input.is_empty() {
+                    self.message = Some("Type a file name to save the playlist to".into());
+                    return;
+                }
+                let mut path = PathBuf::from(expand_tilde(&input));
+                if !playlist::is_playlist_name(&input) {
+                    let mut s = path.into_os_string();
+                    s.push(".m3u");
+                    path = PathBuf::from(s);
+                }
+                let path = playlist::absolute(&path);
+                if path.is_dir() {
+                    self.message = Some(format!("That is a directory: {}", path.display()));
+                    return;
+                }
+                // Overwriting some other file asks first; re-saving the
+                // playlist's own file does not.
+                let other = path.exists() && self.playlist.path() != Some(&path);
+                if other && confirm.as_ref() != Some(&path) {
+                    self.message = Some(format!(
+                        "{} exists — Enter again to overwrite it",
+                        path.display()
+                    ));
+                    if let Some(p) = self.prompt.as_mut() {
+                        p.confirm = Some(path);
+                    }
+                    return;
+                }
+                // A failed write leaves the prompt open to fix the path.
+                if self.save_playlist_as(Some(path)) {
+                    self.prompt = None;
+                }
+            }
         }
     }
 
@@ -1266,7 +1716,7 @@ fn on_off(b: bool) -> &'static str {
     }
 }
 
-fn expand_tilde(s: &str) -> String {
+pub(crate) fn expand_tilde(s: &str) -> String {
     let home = || std::env::var("HOME").unwrap_or_default();
     if s == "~" {
         home()
@@ -1756,7 +2206,7 @@ mod tests {
         let step = app.next_favourite(&key_at(&app, 0), 0).expect("b.mid");
         assert_eq!(step.midi.file_name(), "b.mid");
         assert_eq!(step.soundfont, Some(font), "each entry brings its own font");
-        assert_eq!(step.fav_idx, Some(1));
+        assert_eq!(step.origin, Origin::Favourite(1));
 
         // Past the last entry the playlist stops rather than wrapping.
         assert!(app.next_favourite(&key_at(&app, 2), 2).is_none());
@@ -1765,7 +2215,7 @@ mod tests {
         app.repeat = true;
         let step = app.next_favourite(&key_at(&app, 2), 2).expect("wraps");
         assert_eq!(step.midi.file_name(), "a.mid");
-        assert_eq!(step.fav_idx, Some(0));
+        assert_eq!(step.origin, Origin::Favourite(0));
     }
 
     #[test]
@@ -1775,7 +2225,7 @@ mod tests {
         std::fs::remove_file(midi_dir.path().join("b.mid")).unwrap();
         let step = app.next_favourite(&key_at(&app, 0), 0).expect("c.mid");
         assert_eq!(step.midi.file_name(), "c.mid");
-        assert_eq!(step.fav_idx, Some(2));
+        assert_eq!(step.origin, Origin::Favourite(2));
     }
 
     #[test]
@@ -1799,7 +2249,7 @@ mod tests {
             .next_favourite(&key, 0)
             .expect("the entry that moved up");
         assert_eq!(step.midi.file_name(), "b.mid");
-        assert_eq!(step.fav_idx, Some(0));
+        assert_eq!(step.origin, Origin::Favourite(0));
     }
 
     #[test]
@@ -1812,7 +2262,7 @@ mod tests {
         app.repeat = true;
         let step = app.next_favourite(&key, 0).expect("wraps from the end");
         assert_eq!(step.midi.file_name(), "c.mid");
-        assert_eq!(step.fav_idx, Some(0));
+        assert_eq!(step.origin, Origin::Favourite(0));
     }
 
     #[test]
@@ -1824,8 +2274,8 @@ mod tests {
         let step = app.next_in_source(&a).expect("b.mid follows a.mid");
         assert_eq!(step.midi.file_name(), "b.mid");
         assert_eq!(step.soundfont, None, "the loaded font is kept");
-        assert_eq!(step.fav_idx, None);
-        assert!(app.playlist_position().is_none());
+        assert_eq!(step.origin, Origin::Directory);
+        assert!(app.queue_position().is_none());
     }
 
     #[test]
@@ -1834,12 +2284,12 @@ mod tests {
         app.overlay_open(Source::Favourites);
         app.overlay_activate();
         assert!(app.overlay.is_none(), "the overlay closes on activation");
-        assert_eq!(app.playlist_position(), Some((1, 2)));
+        assert_eq!(app.queue_position(), Some((Source::Favourites, 1, 2)));
 
         // Advancing the queue moves the position along with it.
         let step = app.next_favourite(&key_at(&app, 0), 0).expect("b.mid");
         app.play_step(step);
-        assert_eq!(app.playlist_position(), Some((2, 2)));
+        assert_eq!(app.queue_position(), Some((Source::Favourites, 2, 2)));
         // The queue's own font load is not a choice the user made, so it adds
         // no history row. (The synth cannot load a stub file under test, so
         // this only guards the load path, not the play.)
@@ -1850,21 +2300,25 @@ mod tests {
             .select_loc(&Location::Fs(midi_dir.path().join("a.mid")));
         app.active = Panel::Midi;
         app.activate_selection();
-        assert!(app.playlist_position().is_none());
+        assert!(app.queue_position().is_none());
     }
 
     #[test]
     fn emptying_the_list_while_it_is_the_queue_hides_the_badge() {
         let (mut app, _m, _s, _f) = playlist_app(2);
         app.play_favourite_at(1);
-        assert_eq!(app.playlist_position(), Some((2, 2)));
+        assert_eq!(app.queue_position(), Some((Source::Favourites, 2, 2)));
 
         // Un-starring everything mid-playlist must not report a position in a
         // list that no longer has one.
         app.favs.remove(1);
-        assert_eq!(app.playlist_position(), Some((1, 1)), "clamped to the list");
+        assert_eq!(
+            app.queue_position(),
+            Some((Source::Favourites, 1, 1)),
+            "clamped to the list"
+        );
         app.favs.remove(0);
-        assert!(app.playlist_position().is_none());
+        assert!(app.queue_position().is_none());
     }
 
     #[test]
@@ -1877,8 +2331,245 @@ mod tests {
         assert!(app.message.as_ref().unwrap().contains("gone"));
         assert!(app.now_playing.is_none());
         // The failed start did not make the favourites the queue.
-        assert!(app.playlist_position().is_none());
+        assert!(app.queue_position().is_none());
         // The favourite is kept: the drive may simply be unmounted.
         assert_eq!(app.favs.len(), 1);
+    }
+
+    /// An app whose playlist holds `a.mid` pinned to `one.sf2`, then `b.mid`
+    /// and `c.mid` with no font, all on disk, plus a second font `two.sf2`.
+    fn list_app() -> (App, tempfile::TempDir, tempfile::TempDir) {
+        let (mut app, midi_dir, sf_dir) = test_app();
+        for n in ["a.mid", "b.mid", "c.mid"] {
+            std::fs::write(midi_dir.path().join(n), b"x").unwrap();
+        }
+        for n in ["one.sf2", "two.sf2"] {
+            std::fs::write(sf_dir.path().join(n), b"x").unwrap();
+        }
+        let m = |n: &str| Location::Fs(midi_dir.path().join(n));
+        app.playlist.push(
+            m("a.mid"),
+            Some(Location::Fs(sf_dir.path().join("one.sf2"))),
+        );
+        app.playlist.push(m("b.mid"), None);
+        app.playlist.push(m("c.mid"), None);
+        app.midi.refresh();
+        app.sf2.refresh();
+        (app, midi_dir, sf_dir)
+    }
+
+    fn list_id(app: &App, idx: usize) -> u64 {
+        app.playlist.id_at(idx).unwrap()
+    }
+
+    #[test]
+    fn an_item_without_a_font_plays_through_the_users_font() {
+        let (mut app, _m, sf_dir) = list_app();
+        let two = Location::Fs(sf_dir.path().join("two.sf2"));
+        app.user_font = Some(two.clone());
+
+        let step = app.next_playlist_item(list_id(&app, 0), 0).expect("b.mid");
+        assert_eq!(step.midi.file_name(), "b.mid");
+        // Not one.sf2, which the item before it brought along.
+        assert_eq!(step.soundfont, Some(two));
+        assert_eq!(
+            step.origin,
+            Origin::Playlist {
+                id: list_id(&app, 1),
+                idx: 1
+            }
+        );
+
+        // With repeat on it wraps round to the item with its own font.
+        app.repeat = true;
+        let step = app.next_playlist_item(list_id(&app, 2), 2).expect("wraps");
+        assert_eq!(
+            step.soundfont,
+            Some(Location::Fs(sf_dir.path().join("one.sf2")))
+        );
+        app.repeat = false;
+        assert!(app.next_playlist_item(list_id(&app, 2), 2).is_none());
+    }
+
+    #[test]
+    fn items_without_a_font_are_skipped_until_the_user_has_one() {
+        let (mut app, _m, _s) = list_app();
+        assert!(app.user_font.is_none());
+        app.repeat = true;
+        // b and c have nothing to play through; only a can play.
+        let step = app.next_playlist_item(list_id(&app, 0), 0).expect("a.mid");
+        assert_eq!(step.midi.file_name(), "a.mid");
+
+        app.play_playlist_at(1);
+        assert!(app.message.as_ref().unwrap().contains("no SoundFont"));
+        assert!(
+            app.queue_position().is_none(),
+            "a failed start is not the queue"
+        );
+    }
+
+    #[test]
+    fn fonts_the_queue_loads_do_not_become_the_users_font() {
+        let (mut app, _m, sf_dir) = list_app();
+        let two = Location::Fs(sf_dir.path().join("two.sf2"));
+        app.user_font = Some(two.clone());
+        app.play_playlist_at(0);
+        assert_eq!(app.queue_position(), Some((Source::Playlist, 1, 3)));
+        assert_eq!(app.user_font, Some(two));
+    }
+
+    #[test]
+    fn the_playlist_queue_follows_its_item_through_edits() {
+        let (mut app, _m, sf_dir) = list_app();
+        app.user_font = Some(Location::Fs(sf_dir.path().join("two.sf2")));
+        app.play_playlist_at(1);
+        assert_eq!(app.queue_position(), Some((Source::Playlist, 2, 3)));
+
+        app.playlist.swap(0, 1);
+        assert_eq!(app.queue_position(), Some((Source::Playlist, 1, 3)));
+        // Removed while playing: carry on with what took its slot.
+        let id = list_id(&app, 0);
+        app.playlist.remove(0);
+        let step = app
+            .next_playlist_item(id, 0)
+            .expect("the item that moved up");
+        assert_eq!(step.midi.file_name(), "a.mid");
+    }
+
+    #[test]
+    fn the_playlist_overlay_edits_the_list() {
+        let (mut app, _m, sf_dir) = list_app();
+        app.playlist_open();
+        assert_eq!(app.overlay_source(), Some(Source::Playlist));
+        assert_eq!(app.overlay.as_ref().unwrap().rows.len(), 3);
+
+        // `s` needs a loaded font; `x` unpins.
+        app.overlay_set_font(true);
+        assert!(app.message.as_ref().unwrap().contains("No SoundFont"));
+        app.overlay_set_font(false);
+        assert_eq!(app.playlist.get(0).unwrap().soundfont, None);
+        let two = Location::Fs(sf_dir.path().join("two.sf2"));
+        app.soundfont = Some(two.clone());
+        app.overlay_set_font(true);
+        assert_eq!(app.playlist.get(0).unwrap().soundfont, Some(two));
+
+        app.overlay_move(true);
+        assert_eq!(app.playlist.get(1).unwrap().midi.file_name(), "a.mid");
+        assert_eq!(app.overlay.as_ref().unwrap().state.selected(), Some(1));
+
+        app.overlay_delete();
+        assert_eq!(app.playlist.len(), 2);
+        assert!(app.playlist.is_dirty());
+    }
+
+    #[test]
+    fn adding_from_the_panel_appends_with_or_without_the_font() {
+        let (mut app, midi_dir, sf_dir) = list_app();
+        app.midi
+            .select_loc(&Location::Fs(midi_dir.path().join("b.mid")));
+        app.playlist_add(false);
+        assert_eq!(app.playlist.len(), 4);
+        assert_eq!(app.playlist.get(3).unwrap().soundfont, None);
+        // The cursor moved on, so the next press adds the next file.
+        assert_eq!(
+            app.midi.selected().map(|e| e.name.clone()),
+            Some("c.mid".to_string())
+        );
+
+        app.playlist_add(true);
+        assert!(app.message.as_ref().unwrap().contains("No SoundFont"));
+        assert_eq!(app.playlist.len(), 4);
+        let one = Location::Fs(sf_dir.path().join("one.sf2"));
+        app.soundfont = Some(one.clone());
+        app.playlist_add(true);
+        assert_eq!(app.playlist.get(4).unwrap().soundfont, Some(one));
+
+        // Only from the MIDI panel.
+        app.active = Panel::Sf2;
+        app.playlist_add(false);
+        assert_eq!(app.playlist.len(), 5);
+    }
+
+    #[test]
+    fn quitting_with_unsaved_changes_asks_first() {
+        let (mut app, _m, _s) = list_app();
+        assert!(app.playlist.is_dirty());
+        app.request_quit();
+        assert!(!app.quit, "the first q only warns");
+        app.request_quit();
+        assert!(app.quit);
+
+        // Any other key in between takes the question back.
+        let (mut app, _m, _s) = list_app();
+        app.request_quit();
+        app.disarm_discard();
+        app.request_quit();
+        assert!(!app.quit);
+
+        // Nothing to lose: quit at once.
+        let (mut app, _m, _s) = test_app();
+        app.request_quit();
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn saving_a_new_playlist_asks_for_a_file_and_guards_others() {
+        let (mut app, midi_dir, _s) = list_app();
+        app.playlist_open();
+        app.overlay_save(false);
+        let prompt = app.prompt.as_ref().expect("a new list asks where to save");
+        assert_eq!(prompt.kind, PromptKind::SavePlaylist);
+        assert!(prompt.buf.ends_with("playlist.m3u"));
+
+        // The extension is added when left off.
+        let target = midi_dir.path().join("evening");
+        app.prompt.as_mut().unwrap().buf = target.to_string_lossy().into_owned();
+        app.prompt_submit();
+        assert!(app.prompt.is_none());
+        let saved = midi_dir.path().join("evening.m3u");
+        assert!(saved.is_file());
+        assert!(!app.playlist.is_dirty());
+        assert_eq!(app.playlist.path(), Some(&saved));
+
+        // `w` now saves in place, with no prompt.
+        app.playlist.remove(0);
+        app.overlay_save(false);
+        assert!(app.prompt.is_none());
+        assert!(!app.playlist.is_dirty());
+
+        // Saving over a different, existing file asks for a second Enter.
+        let other = midi_dir.path().join("other.m3u");
+        std::fs::write(&other, "keep me\n").unwrap();
+        app.overlay_save(true);
+        app.prompt.as_mut().unwrap().buf = other.to_string_lossy().into_owned();
+        app.prompt_submit();
+        assert!(app.prompt.is_some());
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "keep me\n");
+        app.prompt_submit();
+        assert!(app.prompt.is_none());
+        assert!(std::fs::read_to_string(&other)
+            .unwrap()
+            .starts_with("#EXTM3U"));
+    }
+
+    #[test]
+    fn enter_on_a_playlist_file_opens_it_and_guards_unsaved_edits() {
+        let (mut app, midi_dir, _s) = list_app();
+        let file = midi_dir.path().join("list.m3u");
+        std::fs::write(&file, "a.mid\n#VOXFONT:sf=x.sf2\n").unwrap();
+        app.midi.refresh();
+        app.midi.select_loc(&Location::Fs(file.clone()));
+        app.active = Panel::Midi;
+
+        // The open list has unsaved edits: the first Enter only asks.
+        app.activate_selection();
+        assert_eq!(app.playlist.len(), 3);
+        assert!(app.overlay.is_none());
+        app.activate_selection();
+        assert_eq!(app.playlist.len(), 1);
+        assert_eq!(app.playlist.path(), Some(&file));
+        assert_eq!(app.overlay_source(), Some(Source::Playlist));
+        assert!(app.message.as_ref().unwrap().contains("1 line ignored"));
+        assert!(app.now_playing.is_none(), "opening does not play");
     }
 }

@@ -417,8 +417,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    if transport_key(app, key) {
+        return;
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('Q') => app.request_quit(),
@@ -446,23 +448,6 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('a') => app.playlist_add(false),
         KeyCode::Char('A') => app.playlist_add(true),
 
-        KeyCode::Char('p') | KeyCode::Char(' ') => app.toggle_pause(),
-        KeyCode::Char('s') => app.stop(),
-
-        KeyCode::Left => app.seek_seconds(-5),
-        KeyCode::Right => app.seek_seconds(5),
-        KeyCode::Char('[') => app.seek_seconds(-30),
-        KeyCode::Char(']') => app.seek_seconds(30),
-
-        KeyCode::Char('<') => app.volume_delta(-1),
-        KeyCode::Char('>') => app.volume_delta(1),
-        KeyCode::Char(',') => app.volume_delta(-5),
-        KeyCode::Char('.') => app.volume_delta(5),
-        KeyCode::Char(d @ '1'..='9') if alt => app.set_volume((d as u8 - b'0') * 10),
-
-        // Playback modes.
-        KeyCode::Char('n') => app.toggle_next_mode(),
-        KeyCode::Char('r') if !ctrl => app.toggle_repeat(),
         KeyCode::Char('H') => app.toggle_hidden(),
 
         // Ctrl-r reloads the active panel.
@@ -479,7 +464,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 /// Keys while the history, favourites or playlist overlay is open. `Enter`
 /// plays the selected row with its SoundFont; the overlay otherwise navigates
 /// like a panel. `R`, `F` and `P` switch between the stores, or close the one
-/// showing.
+/// showing. The transport keys work here too, since an overlay stays open
+/// while its list plays.
 fn handle_overlay_key(app: &mut App, key: KeyEvent) {
     // `/` filter mode captures printable keys; cursor keys still move.
     if app.overlay_filtering() {
@@ -497,6 +483,9 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
     if key.code != KeyCode::Char('D') {
         app.overlay_cancel_confirm();
     }
+    if transport_key(app, key) {
+        return;
+    }
 
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => app.overlay_close(),
@@ -513,7 +502,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
             _ => app.playlist_open(),
         },
         // Playlist editing; each is a no-op in the other overlays.
-        KeyCode::Char('s') => app.overlay_set_font(true),
+        KeyCode::Char('S') => app.overlay_set_font(true),
         KeyCode::Char('x') => app.overlay_set_font(false),
         KeyCode::Char('w') => app.overlay_save(false),
         KeyCode::Char('W') => app.overlay_save(true),
@@ -531,6 +520,35 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('/') | KeyCode::Char('g') => app.overlay_start_filter(),
         _ => overlay_move_key(app, key),
     }
+}
+
+/// Pause, stop, seek, volume and the playback modes, shared by the panels and
+/// the overlays, none of which gives these keys another meaning. Returns false
+/// for any other key.
+fn transport_key(app: &mut App, key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Char('p') | KeyCode::Char(' ') => app.toggle_pause(),
+        KeyCode::Char('s') => app.stop(),
+
+        KeyCode::Left => app.seek_seconds(-5),
+        KeyCode::Right => app.seek_seconds(5),
+        KeyCode::Char('[') => app.seek_seconds(-30),
+        KeyCode::Char(']') => app.seek_seconds(30),
+
+        KeyCode::Char('<') => app.volume_delta(-1),
+        KeyCode::Char('>') => app.volume_delta(1),
+        KeyCode::Char(',') => app.volume_delta(-5),
+        KeyCode::Char('.') => app.volume_delta(5),
+        KeyCode::Char(d @ '1'..='9') if alt => app.set_volume((d as u8 - b'0') * 10),
+
+        // Playback modes.
+        KeyCode::Char('n') => app.toggle_next_mode(),
+        KeyCode::Char('r') if !ctrl => app.toggle_repeat(),
+        _ => return false,
+    }
+    true
 }
 
 /// Cursor movement inside the overlay, shared by both its modes.

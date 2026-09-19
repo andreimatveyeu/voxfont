@@ -108,18 +108,25 @@ Press <kbd>R</kbd> for the history, newest at the top:
 │ 2026-09-16 17:13 —                        2MBGMGS.SF2                   2x │
 │ track  /home/me/midi/CANYON.MID   (2 min ago)                              │
 │ font   /srv/sf2/CT8MGM.SF2                                                 │
-└ Enter play · Tab view · f star · G reveal · d forget · / filter ───────────┘
+└ Enter play from here · Tab view · f star · G reveal · d forget · / filter ─┘
 ```
 
 | Key | Action |
 | --- | --- |
-| `Enter` | replay: load the font, play the track, move the panels onto it |
+| `Enter` | replay: load the font, play the track, move the panels onto it; then play on down the rows |
 | `Tab` | switch view: combinations · one row per track · one per SoundFont |
 | `G` | point both panels at the entry without playing it |
 | `f` | star the row as a favourite (marked `★` in the second column) |
 | `d` | forget the selected entry · `D` erase the whole history (asks twice) |
 | `/` | filter by track or SoundFont name |
-| `Esc` / `q` | close |
+| `Esc` / `q` / `R` | close |
+
+`Enter` makes the rows the queue, exactly as they are shown — in the view and
+filter you chose — so **next** mode plays on down them, each through its own
+SoundFont. Playing reorders the history, but not the queue: while the history is
+the queue, reopening <kbd>R</kbd> shows the queue's rows, and pressing
+<kbd>Enter</kbd> again takes a fresh copy. Rows without a track are skipped.
+See [Overlays](#overlays) for how the queue relates to the overlay being open.
 
 A row marked `!` can no longer be played, because the file has moved or been
 deleted. Entries inside a `.zip` archive are stored as archive plus member, so
@@ -176,7 +183,7 @@ Press <kbd>F</kbd> for the list, in playlist order:
 | `G` | point both panels at the entry without playing it |
 | `d` or `f` | take the star off |
 | `/` | filter by track or SoundFont name |
-| `Esc` / `q` | close |
+| `Esc` / `q` / `F` | close |
 
 `Enter` makes the favourites the queue: when a track ends, **next** mode moves
 to the next starred pair and loads *its* SoundFont, so a list can walk one tune
@@ -225,21 +232,21 @@ for the playlist already open.
 │!    4 popcorn.mid                    (your font)                           │
 │ track  /home/me/midi/CANYON.MID                                            │
 │ font   /srv/sf2/CT8MGM.SF2                                                 │
-└ Enter play from here · ⇧↑↓ move · s set font · x clear font · d remove … ──┘
+└ Enter play from here · ⇧↑↓ move · S set font · x clear font · d remove … ──┘
 ```
 
 | Key | Action |
 | --- | --- |
 | `Enter` | play the list from this item on |
 | `Shift`+`↑` `↓` | move the item up or down (`K` / `J` too) |
-| `s` | pin the loaded SoundFont to the item |
+| `S` | pin the loaded SoundFont to the item |
 | `x` | unpin the item, so it plays through your font |
 | `d` | remove the item |
 | `f` | star the item's track and the font it plays through |
 | `G` | point both panels at the item without playing it |
 | `w` | save · `W` save as a new file |
 | `/` | filter by track or SoundFont name |
-| `Esc` / `q` | close |
+| `Esc` / `q` / `P` | close |
 
 To build a list, put the cursor on a MIDI file and press <kbd>a</kbd> to add it
 unpinned, or <kbd>A</kbd> to add it pinned to the loaded SoundFont. The cursor
@@ -255,7 +262,8 @@ asks for a second <kbd>q</kbd> or <kbd>Enter</kbd>.
 As with the favourites, playing an item makes the playlist the queue: the
 **next** and **repeat** modes step through it, the player bar shows `List 3/12`,
 and <kbd>Enter</kbd> on a file in the MIDI panel hands the queue back to the
-directory. Items that cannot play are skipped rather than dropped, whether their
+directory. See [Overlays](#overlays) for how the queue relates to the overlay
+being open. Items that cannot play are skipped rather than dropped, whether their
 files have gone (marked `!`) or they are unpinned and you have not chosen a font
 yet.
 
@@ -332,6 +340,23 @@ Quick non-interactive check of the audio/FluidSynth path:
 voxfont --selftest /path/to/font.sf2 /path/to/song.mid
 ```
 
+### Overlays
+
+The history (<kbd>R</kbd>), the favourites (<kbd>F</kbd>) and the playlist
+(<kbd>P</kbd>) are views beside the file panels, not dialogs. An overlay keeps
+to the panels' space, leaving the player bar and the key hints in view, and
+stays open when you press <kbd>Enter</kbd> on a row. The player keys work inside
+it just as they do in the panels: `Space` pauses, `s` stops, `←` `→` `[` `]`
+seek, `<` `>` `,` `.` change the volume, `n` and `r` toggle the modes.
+
+A list plays on only while its overlay is open. Close it and the current track
+plays to its end, then playback stops; the badge on the player bar (`Hist`,
+`Favs` or `List`) dims to say so. Reopen it before then and the list carries on
+as if it had never been closed. Reopen it after, and nothing starts by itself,
+but the cursor is on the entry that would have played next, so
+<kbd>Enter</kbd> picks up from there. Opening a different overlay counts as
+closing this one. The directory is the one queue that plays on regardless.
+
 ## Keys
 
 | Key | Action |
@@ -347,7 +372,7 @@ voxfont --selftest /path/to/font.sf2 /path/to/song.mid
 | `r` | toggle **repeat** mode |
 | `<` `>` | volume −1 / +1 · `,` `.` volume −5 / +5 |
 | `Alt`+`1`…`9` | set volume 10%…90% |
-| `R` | playing history (`Enter` replays the track with its SoundFont) |
+| `R` | playing history (`Enter` replays the track with its SoundFont, then plays on down the list) |
 | `f` | star the track + SoundFont being heard as a favourite |
 | `F` | favourites (`Enter` plays the starred list from there on) |
 | `P` | playlist (`Enter` plays it from there on, `w` saves) |
@@ -367,9 +392,10 @@ what happens when a track ends:
 | on | off | play through the directory, then stop |
 | on | on | loop the whole directory |
 
-When playback was started from the favourites (<kbd>F</kbd> → <kbd>Enter</kbd>)
-or the playlist (<kbd>P</kbd> → <kbd>Enter</kbd>), "the directory" in that table
-becomes that list.
+When playback was started from the history (<kbd>R</kbd> → <kbd>Enter</kbd>),
+the favourites (<kbd>F</kbd> → <kbd>Enter</kbd>) or the playlist
+(<kbd>P</kbd> → <kbd>Enter</kbd>), "the directory" in that table becomes that
+list — while its overlay is open (see [Overlays](#overlays)).
 
 ## License
 

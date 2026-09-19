@@ -60,12 +60,27 @@ pub enum Source {
 
 /// Where the *next* track comes from when the current one finishes. Set by
 /// whatever started playing: browsing plays on through the directory, a
-/// favourite plays on through the favourites list, a playlist item through the
-/// playlist. There is deliberately no separate "playlist mode" to toggle — as
-/// with directory playback, where you started decides what follows.
+/// history row through the history, a favourite through the favourites list, a
+/// playlist item through the playlist. There is deliberately no separate
+/// "playlist mode" to toggle — as with directory playback, where you started
+/// decides what follows.
+///
+/// The overlays are views beside the panels, and a list only plays on while
+/// its view is showing: closing the overlay lets the current track finish and
+/// stops there, and reopening it picks the queue up again. See
+/// [`App::queue_live`].
 #[derive(Clone)]
 enum PlaySource {
     Directory,
+    /// Playing the history. Playing reorders the log it is built from, so the
+    /// queue is the rows as they were shown when `Enter` was pressed, with the
+    /// view and filter that produced them; `idx` is the playing row.
+    History {
+        rows: Vec<Row>,
+        view: View,
+        filter: String,
+        idx: usize,
+    },
     /// Playing the favourites list. `key` identifies the entry that is playing
     /// so the position survives a reorder; `idx` is where it sat, used as a
     /// fallback if that entry is un-starred while it plays.
@@ -86,6 +101,7 @@ enum PlaySource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Origin {
     Directory,
+    History(usize),
     Favourite(usize),
     Playlist { id: u64, idx: usize },
 }
@@ -219,6 +235,10 @@ pub struct App {
     pub overlay: Option<Overlay>,
     /// Where the next track comes from when this one ends.
     play_source: PlaySource,
+    /// Set when playback stopped at the end of a track only because the
+    /// queue's overlay was closed, so reopening it can put the cursor on what
+    /// would have played next. Cleared whenever a track starts.
+    queue_held: bool,
 
     /// Temp files backing the current track / SoundFont when they come from an
     /// archive. Kept alive while in use; dropping them deletes the temp file.
@@ -273,6 +293,7 @@ impl App {
             pending: None,
             overlay: None,
             play_source: PlaySource::Directory,
+            queue_held: false,
             play_temp: None,
             sf_temp: None,
             volume,
@@ -507,6 +528,7 @@ impl App {
                 self.cur_info = midi::parse(&path);
                 self.now_playing = Some(loc.clone());
                 self.last_played = Some(loc.clone());
+                self.queue_held = false;
                 self.play_temp = guard;
                 self.state = PlayState::Playing;
                 self.play_started = Some(Instant::now());
@@ -638,10 +660,21 @@ impl App {
             }
         };
 
+        self.track_ended(cur);
+    }
+
+    /// Apply the next/repeat modes to `cur`, which has just finished.
+    fn track_ended(&mut self, cur: Location) {
         if self.next_mode {
             match self.next_in_source(&cur) {
                 Some(step) => self.play_step(step),
-                None => self.stop(),
+                None => {
+                    // A queue held back only by its closed overlay still has
+                    // somewhere to go: reopening it puts the cursor there.
+                    let held = !self.queue_live() && self.next_in_list().is_some();
+                    self.stop();
+                    self.queue_held = held;
+                }
             }
         } else if self.repeat {
             self.play_track(cur, false); // loop the current track
@@ -651,9 +684,13 @@ impl App {
     }
 
     /// What follows `cur`, according to the current play source. `None` means
-    /// there is nothing left to play and the player should stop.
+    /// there is nothing left to play and the player should stop — which is
+    /// also the case while the queue's overlay is closed.
     fn next_in_source(&mut self, cur: &Location) -> Option<Step> {
-        match self.play_source.clone() {
+        if !self.queue_live() {
+            return None;
+        }
+        match &self.play_source {
             PlaySource::Directory => {
                 let next = match self.midi.neighbour_file(cur, true) {
                     Some(n) => Some(n),
@@ -669,9 +706,69 @@ impl App {
                     origin: Origin::Directory,
                 })
             }
-            PlaySource::Favourites { key, idx } => self.next_favourite(&key, idx),
-            PlaySource::Playlist { id, idx } => self.next_playlist_item(id, idx),
+            _ => self.next_in_list(),
         }
+    }
+
+    /// What follows the playing entry when the queue is a list (the history,
+    /// the favourites or the playlist), whether or not its overlay is open.
+    fn next_in_list(&self) -> Option<Step> {
+        match &self.play_source {
+            PlaySource::Directory => None,
+            PlaySource::History { rows, idx, .. } => self.next_history_row(rows, *idx),
+            PlaySource::Favourites { key, idx } => self.next_favourite(key, *idx),
+            PlaySource::Playlist { id, idx } => self.next_playlist_item(*id, *idx),
+        }
+    }
+
+    /// Which overlay the queue belongs to; `None` for the directory.
+    fn queue_source(&self) -> Option<Source> {
+        match self.play_source {
+            PlaySource::Directory => None,
+            PlaySource::History { .. } => Some(Source::History),
+            PlaySource::Favourites { .. } => Some(Source::Favourites),
+            PlaySource::Playlist { .. } => Some(Source::Playlist),
+        }
+    }
+
+    /// Whether the queue plays on past the current track. A list does only
+    /// while its overlay is open; the queue itself is kept while the overlay
+    /// is closed, so reopening it carries on from where it was. The directory
+    /// always plays on.
+    pub fn queue_live(&self) -> bool {
+        match self.queue_source() {
+            None => true,
+            source => self.overlay_source() == source,
+        }
+    }
+
+    /// Walk forward through the history rows the queue was started from,
+    /// skipping rows without a track (a SoundFont on its own) and rows whose
+    /// files have gone, with the same one-pass cap as [`Self::next_favourite`].
+    /// A row without a SoundFont plays through the loaded one.
+    fn next_history_row(&self, rows: &[Row], idx: usize) -> Option<Step> {
+        let n = rows.len();
+        for offset in 1..=n {
+            let i = match idx + offset {
+                i if i < n => i,
+                i if self.repeat => i % n,
+                _ => return None,
+            };
+            let row = &rows[i];
+            let midi = match &row.midi {
+                Some(m) if m.exists() => m.clone(),
+                _ => continue,
+            };
+            if row.soundfont.as_ref().is_some_and(|sf| !sf.exists()) {
+                continue;
+            }
+            return Some(Step {
+                midi,
+                soundfont: row.soundfont.clone(),
+                origin: Origin::History(i),
+            });
+        }
+        None
     }
 
     /// Walk forward through the favourites from the entry that just played,
@@ -765,6 +862,11 @@ impl App {
             }
         }
         match (step.origin, step.soundfont) {
+            (Origin::History(i), _) => {
+                if let PlaySource::History { idx, .. } = &mut self.play_source {
+                    *idx = i;
+                }
+            }
             (Origin::Favourite(idx), Some(sf)) => {
                 self.play_source = PlaySource::Favourites {
                     key: (step.midi.clone(), sf),
@@ -854,6 +956,16 @@ impl App {
             self.history
                 .record(p.midi, p.soundfont, history::now_secs(), p.count);
             self.history.save();
+            // An overlay stays open while its list plays, so keep the play
+            // counts current. The favourites' and the playlist's rows are the
+            // list itself, so the cursor stays put; the history's would shift
+            // under it, and while it is the queue they are the queue's rows.
+            if matches!(
+                self.overlay_source(),
+                Some(Source::Favourites | Source::Playlist)
+            ) {
+                self.overlay_rebuild(true);
+            }
         }
     }
 
@@ -945,6 +1057,7 @@ impl App {
         // Either list can be emptied, or shortened, while it is the queue.
         let (source, found, idx, n) = match &self.play_source {
             PlaySource::Directory => return None,
+            PlaySource::History { rows, idx, .. } => (Source::History, None, *idx, rows.len()),
             PlaySource::Favourites { key, idx } => (
                 Source::Favourites,
                 self.favs.position_of(&key.0, &key.1),
@@ -984,10 +1097,21 @@ impl App {
         if self.search.is_some() {
             self.search_cancel();
         }
-        let view = View::Pairs;
-        let rows = self.overlay_rows(source, view, "");
+        // While the history is the queue, its overlay reopens on the queue's
+        // rows rather than on the log as it has since become.
+        let (view, filter, rows) = match &self.play_source {
+            PlaySource::History {
+                rows, view, filter, ..
+            } if source == Source::History => (*view, filter.clone(), rows.clone()),
+            _ => (
+                View::Pairs,
+                String::new(),
+                self.overlay_rows(source, View::Pairs, ""),
+            ),
+        };
         let mut state = ListState::default();
-        state.select((!rows.is_empty()).then_some(0));
+        let at = self.queue_cursor(source, &rows).unwrap_or(0);
+        state.select((!rows.is_empty()).then(|| at.min(rows.len() - 1)));
         self.message = match source {
             Source::History if self.history.is_empty() => Some("History is empty".to_string()),
             Source::Favourites if self.favs.is_empty() => {
@@ -1004,10 +1128,35 @@ impl App {
             view,
             state,
             rows,
-            filter: String::new(),
+            filter,
             filtering: false,
             confirm_clear: false,
         });
+    }
+
+    /// Where the cursor goes when `source`'s overlay opens on `rows` while
+    /// that list is the queue: on the track playing, or — when playback
+    /// stopped only because the overlay was closed — on the one that would
+    /// have followed, so `Enter` carries on from there.
+    fn queue_cursor(&self, source: Source, rows: &[Row]) -> Option<usize> {
+        if self.queue_source() != Some(source) {
+            return None;
+        }
+        let next = match self.queue_held {
+            true => self.next_in_list().map(|s| s.origin),
+            false => None,
+        };
+        let i = match (next, &self.play_source) {
+            (Some(Origin::History(i) | Origin::Favourite(i)), _) => i,
+            (Some(Origin::Playlist { idx, .. }), _) => idx,
+            (_, PlaySource::History { idx, .. }) => *idx,
+            _ => self.queue_position()?.1 - 1,
+        };
+        match source {
+            // The history's rows are the queue's own, one for one.
+            Source::History => Some(i),
+            _ => rows.iter().position(|r| r.idxs.first() == Some(&i)),
+        }
     }
 
     fn overlay_rows(&self, source: Source, view: View, filter: &str) -> Vec<Row> {
@@ -1098,22 +1247,38 @@ impl App {
         self.overlay_rebuild(false);
     }
 
-    /// Play the selected row. From the history that means hearing the entry
-    /// again exactly as it was, and the queue reverts to the directory; from
-    /// the favourites or the playlist it starts that list at the entry.
+    /// Play the selected row and make its list the queue, from that row on.
+    /// From the history that means hearing the entry again exactly as it was,
+    /// then the rows below it as they are shown now. The overlay stays open,
+    /// since it is what keeps the list playing; only its filter stops
+    /// capturing keys, so the transport keys work.
     pub fn overlay_activate(&mut self) {
-        let (source, row) = match self.overlay.as_ref() {
-            Some(o) => match o.selected() {
-                Some(r) => (o.source, r.clone()),
-                None => return,
-            },
+        let (source, row, at) = match self.overlay.as_mut() {
+            Some(o) => {
+                o.filtering = false;
+                match (o.selected(), o.state.selected()) {
+                    (Some(r), Some(at)) => (o.source, r.clone(), at),
+                    _ => return,
+                }
+            }
             None => return,
         };
-        self.overlay = None;
         match source {
             Source::History => {
                 self.play_source = PlaySource::Directory;
-                self.play_combination(row.midi, row.soundfont);
+                let track = row.midi.is_some();
+                // A SoundFont-only row just loads the font; there is no track
+                // to start the queue with.
+                if self.play_combination(row.midi, row.soundfont) && track {
+                    if let Some(o) = &self.overlay {
+                        self.play_source = PlaySource::History {
+                            rows: o.rows.clone(),
+                            view: o.view,
+                            filter: o.filter.clone(),
+                            idx: at,
+                        };
+                    }
+                }
             }
             Source::Favourites => {
                 if let Some(&idx) = row.idxs.first() {
@@ -1901,9 +2066,16 @@ mod tests {
         app.history_open();
         app.overlay_activate();
 
-        assert!(app.overlay.is_none(), "the overlay closes on activation");
-        assert!(app.message.unwrap().contains("gone"));
+        assert!(
+            app.overlay.is_some(),
+            "the overlay stays open on activation"
+        );
+        assert!(app.message.as_ref().unwrap().contains("gone"));
         assert!(app.now_playing.is_none());
+        assert!(
+            app.queue_position().is_none(),
+            "a failed start is not the queue"
+        );
     }
 
     #[test]
@@ -1956,7 +2128,10 @@ mod tests {
             Some(Location::Fs(font.clone()))
         );
 
-        // A plain file moves the cursor the same way.
+        // A plain file moves the cursor the same way. (Hand the queue back
+        // first: while the history is the queue, its overlay reopens on the
+        // queue's rows, which predate this entry.)
+        app.play_source = PlaySource::Directory;
         app.history.record(
             Some(Location::Fs(loose.clone())),
             Some(Location::Fs(font)),
@@ -2283,7 +2458,10 @@ mod tests {
         let (mut app, midi_dir, _s, _f) = playlist_app(2);
         app.overlay_open(Source::Favourites);
         app.overlay_activate();
-        assert!(app.overlay.is_none(), "the overlay closes on activation");
+        assert!(
+            app.overlay.is_some(),
+            "the overlay stays open on activation"
+        );
         assert_eq!(app.queue_position(), Some((Source::Favourites, 1, 2)));
 
         // Advancing the queue moves the position along with it.
@@ -2434,6 +2612,102 @@ mod tests {
             .next_playlist_item(id, 0)
             .expect("the item that moved up");
         assert_eq!(step.midi.file_name(), "a.mid");
+    }
+
+    #[test]
+    fn the_playlist_plays_on_only_while_its_overlay_is_open() {
+        let (mut app, _m, sf_dir) = list_app();
+        app.user_font = Some(Location::Fs(sf_dir.path().join("two.sf2")));
+        app.playlist_open();
+        app.overlay_start_filter();
+        app.overlay_activate();
+        // Playing an item leaves the overlay open, no longer filtering.
+        assert_eq!(app.overlay_source(), Some(Source::Playlist));
+        assert!(!app.overlay_filtering());
+        assert_eq!(app.queue_position(), Some((Source::Playlist, 1, 3)));
+        let a = app.playlist.get(0).unwrap().midi.clone();
+        let step = app.next_in_source(&a).expect("b.mid follows while open");
+        assert_eq!(step.midi.file_name(), "b.mid");
+
+        // Closed: the queue is kept, but nothing follows the current item.
+        app.overlay_close();
+        assert!(app.next_in_source(&a).is_none());
+        assert_eq!(app.queue_position(), Some((Source::Playlist, 1, 3)));
+        // Nor while another overlay has taken its place.
+        app.history_open();
+        assert!(app.next_in_source(&a).is_none());
+
+        // Reopened on the playing item, and the list carries on.
+        app.play_step(step);
+        app.overlay_close();
+        app.playlist_open();
+        assert_eq!(app.overlay.as_ref().unwrap().state.selected(), Some(1));
+        let b = app.playlist.get(1).unwrap().midi.clone();
+        let step = app.next_in_source(&b).expect("c.mid follows once reopened");
+        assert_eq!(step.midi.file_name(), "c.mid");
+    }
+
+    #[test]
+    fn a_queue_stopped_by_its_closed_overlay_reopens_on_what_follows() {
+        let (mut app, _m, sf_dir) = list_app();
+        app.user_font = Some(Location::Fs(sf_dir.path().join("two.sf2")));
+        app.playlist_open();
+        app.overlay_activate();
+        app.overlay_close();
+        // The item ends with the overlay closed: playback stops...
+        app.next_mode = true;
+        app.state = PlayState::Playing;
+        let a = app.playlist.get(0).unwrap().midi.clone();
+        app.track_ended(a);
+        assert!(app.queue_held);
+        // ...and reopening does not resume it, but lands on the next item.
+        app.playlist_open();
+        assert!(app.state == PlayState::Stopped, "not resumed");
+        assert_eq!(app.overlay.as_ref().unwrap().state.selected(), Some(1));
+
+        // A stop by hand leaves the cursor on the item that was playing.
+        app.queue_held = false;
+        app.playlist_open();
+        assert_eq!(app.overlay.as_ref().unwrap().state.selected(), Some(0));
+    }
+
+    #[test]
+    fn the_history_is_a_queue_of_its_rows_as_shown() {
+        let (mut app, midi_dir, sf_dir) = test_app();
+        let font = Location::Fs(sf_dir.path().join("f.sf2"));
+        std::fs::write(sf_dir.path().join("f.sf2"), b"x").unwrap();
+        for (n, when) in [("a.mid", 300), ("b.mid", 200), ("c.mid", 100)] {
+            std::fs::write(midi_dir.path().join(n), b"x").unwrap();
+            let m = Location::Fs(midi_dir.path().join(n));
+            app.history.record(Some(m), Some(font.clone()), when, true);
+        }
+        // A SoundFont-only row is skipped by the queue.
+        app.history.record(None, Some(font.clone()), 250, true);
+        app.history_open();
+        app.overlay_activate();
+        assert_eq!(app.overlay_source(), Some(Source::History));
+        assert_eq!(app.queue_position(), Some((Source::History, 1, 4)));
+        let a = Location::Fs(midi_dir.path().join("a.mid"));
+        let step = app.next_in_source(&a).expect("b.mid follows");
+        assert_eq!(step.midi.file_name(), "b.mid");
+        assert_eq!(step.origin, Origin::History(2));
+
+        // Playing reorders the log, but not the queue.
+        app.play_step(step);
+        let b = Location::Fs(midi_dir.path().join("b.mid"));
+        app.history.record(Some(b.clone()), Some(font), 400, true);
+        app.overlay_close();
+        assert!(app.next_in_source(&b).is_none(), "closed: nothing follows");
+        app.history_open();
+        let ov = app.overlay.as_ref().unwrap();
+        assert_eq!(ov.state.selected(), Some(2));
+        assert_eq!(name_at(ov, 2), "b.mid");
+        let step = app.next_in_source(&b).expect("c.mid follows once reopened");
+        assert_eq!(step.midi.file_name(), "c.mid");
+    }
+
+    fn name_at(ov: &Overlay, i: usize) -> String {
+        ov.rows[i].midi.as_ref().unwrap().file_name()
     }
 
     #[test]

@@ -32,8 +32,10 @@ pub fn draw(f: &mut App, frame: &mut Frame) {
     draw_player(f, frame, rows[1]);
     draw_hints(f, frame, rows[2]);
 
+    // An overlay stays open while its list plays, so it keeps to the panels
+    // and leaves the player bar and the key hints in view.
     if f.overlay.is_some() {
-        draw_overlay(f, frame, area);
+        draw_overlay(f, frame, rows[0]);
     }
     if f.show_help {
         draw_help(frame, area);
@@ -263,19 +265,23 @@ fn draw_player(app: &App, frame: &mut Frame, area: Rect) {
         if app.current_is_favourite() { on } else { off },
     ));
     // While the favourites or the playlist are the queue, show how far along.
+    // A list only plays on while its overlay is open; closed, its badge dims
+    // like a mode that is off.
     if let Some((source, at, n)) = app.queue_position() {
         let label = match source {
+            Source::History => "Hist",
+            Source::Favourites => "Favs",
             Source::Playlist => "List",
-            _ => "Favs",
         };
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!(" {label} {at}/{n} "),
-            Style::default()
+        let style = match app.queue_live() {
+            false => off,
+            true => Style::default()
                 .fg(Color::Black)
                 .bg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
-        ));
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(format!(" {label} {at}/{n} "), style));
     }
 
     if let Some(msg) = &app.message {
@@ -339,6 +345,16 @@ fn draw_hints(app: &App, frame: &mut Frame, area: Rect) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
+    // The overlays leave this line in view; say which keys still reach the
+    // player from inside one.
+    if app.overlay.is_some() {
+        let hint = "Enter play  Space pause  s stop  ←/→ seek  n next-mode  r repeat  </> vol  Esc close — the current track plays out";
+        frame.render_widget(
+            Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+            area,
+        );
+        return;
+    }
     let hint = "Tab panels  Enter play/load  Space pause  s stop  ←/→ seek  n next-mode  r repeat  </> vol  i go  G playing  R history  f star  F favs  P playlist  a add  / filter  h help  q quit";
     frame.render_widget(
         Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
@@ -372,8 +388,8 @@ fn draw_overlay(app: &mut App, frame: &mut Frame, area: Rect) {
 
     let w = area.width.saturating_sub(4).min(110);
     // Tall enough for the rows it has (headings + list + detail + borders),
-    // without covering more of the player than it needs to — and never taller
-    // than the terminal, however small that is.
+    // without covering more of the panels than it needs to — and never taller
+    // than the space they have, however small that is.
     let max_h = area.height.saturating_sub(2);
     let h = (count as u16 + 5).max(6.min(max_h)).min(max_h);
     let popup = Rect {
@@ -403,13 +419,13 @@ fn draw_overlay(app: &mut App, frame: &mut Frame, area: Rect) {
     };
     let hint = match source {
         Source::History => {
-            " Enter play · Tab view · f star · G reveal · d forget · D erase all · / filter · Esc close "
+            " Enter play from here · Tab view · f star · G reveal · d forget · D erase all · / filter "
         }
         Source::Favourites => {
-            " Enter play from here · ⇧↑↓ move · d remove · G reveal · / filter · Esc close "
+            " Enter play from here · ⇧↑↓ move · d remove · G reveal · / filter "
         }
         Source::Playlist => {
-            " Enter play from here · ⇧↑↓ move · s set font · x clear font · d remove · w save · W save as · / filter "
+            " Enter play from here · ⇧↑↓ move · S set font · x clear font · d remove · w save · W save as · / filter "
         }
     };
     let block = Block::default()
@@ -652,10 +668,11 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  U              go up a directory"),
         Line::from("  i              go to directory (Tab completes)"),
         Line::from("  G              jump to playing track / loaded SoundFont"),
-        Line::from("  R              playing history (Enter replays track + SoundFont)"),
+        Line::from("  R              playing history — Enter plays it from there"),
         Line::from("  f              star the track + SoundFont being heard"),
         Line::from("  F              favourites — Enter plays the list from there"),
         Line::from("  P              playlist — Enter plays it from there, w saves"),
+        Line::from("                 R/F/P lists play on only while they are open"),
         Line::from("  a / A          add MIDI file to the playlist (A: with loaded font)"),
         Line::from("  Space / p      pause / resume"),
         Line::from("  s              stop"),
@@ -911,9 +928,15 @@ mod tests {
         assert!(out.contains("Playlist — untitled · 2 · modified"), "{out}");
         assert!(out.contains("CT8MGM.SF2"), "{out}");
         assert!(out.contains("(your font)"), "{out}");
-        assert!(out.contains("s set font"), "{out}");
+        assert!(out.contains("S set font"), "{out}");
         // The first column numbers the items.
         assert!(out.contains("     1 CANYON.MID"), "{out}");
+
+        // The overlay keeps to the panels: the player bar and the hints, which
+        // now list the keys that reach the player, stay in view.
+        assert!(out.contains(" Player "), "{out}");
+        assert!(out.contains("Space pause"), "{out}");
+        assert!(out.contains("s stop"), "{out}");
 
         // The save prompt takes over the bottom line.
         app.overlay_save(false);
